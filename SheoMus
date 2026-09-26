@@ -1,2 +1,1103 @@
-# meta developer: @xsheo
-# meta banner: https://t.me/tgsheo
+# meta developer: @sheomod
+# meta banner: https://t.me/xsheo
+
+from .. import loader, utils
+import asyncio
+import time
+import re
+import logging
+import hashlib
+from telethon.tl.types import (
+    Message,
+    DocumentAttributeFilename,
+    DocumentAttributeAudio,
+)
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_BOTS = [
+    "Lybot",
+    "vkmusic_bot",
+    "tgmusicbot",
+    "spotifydownloader_bot",
+    "losslessrobot",
+    "loaditbot",
+]
+
+PREFERRED_BOTS = {"vkmusic_bot", "tgmusicbot", "spotifydownloader_bot"}
+
+# Веса небольшие — только для разрешения ничьих.
+# Не должны перетаскивать весь топ на одного бота.
+BOT_WEIGHTS = {
+    "vkmusic_bot": 4,
+    "tgmusicbot": 3,
+    "spotifydownloader_bot": 3,
+    "losslessrobot": 3,
+    "loaditbot": 2,
+    "lybot": 1,
+}
+
+NOISE_WORDS = {
+    "скачать", "download", "минус", "минусовка", "minus",
+    "official", "lyrics", "текст", "клип", "clip",
+    "hd", "hq", "mp3", "flac", "audio", "video",
+    "песня", "song", "трек", "track", "music", "музыка",
+}
+
+PAGE_SIZE = 10
+DOC_TTL = 600
+BOT_FAIL_TTL = 3600
+SPAM_WINDOW = 5
+CLEANUP_INTERVAL = 60
+
+SEARCH_TIMEOUT = 6.0
+SEARCH_TOTAL_TIMEOUT = 7.5
+COOLDOWN_RETRY_DELAY = 1.2
+
+RESULTS_PER_BOT = 15
+RAW_SCAN_LIMIT = 40
+MAX_RESULTS = 50
+SEARCH_CACHE_TTL = 30
+
+# Максимум треков с одинаковым title (от разных ботов) в выдаче.
+PER_TITLE_LIMIT = 3
+
+
+class SheoMusMod(loader.Module):
+    """Мультипоиск музыки"""
+
+    strings = {"name": "SheoMus"}
+
+    def __init__(self):
+        self.database = None
+        self.client = None
+        self.spam_protection = {}
+        self.failed_bots = {}
+        self.doc_cache = {}
+        self.search_cache = {}
+        self.emojis_enabled = True
+        self._last_cleanup = time.time()
+        super().__init__()
+
+    async def client_ready(self, client, database):
+        self.client = client
+        self.database = database
+        if not self.database.get("SheoMus", "allowed_chats"):
+            self.database.set("SheoMus", "allowed_chats", [])
+        if not self.database.get("SheoMus", "music_bots"):
+            self.database.set("SheoMus", "music_bots", DEFAULT_BOTS.copy())
+        self.emojis_enabled = self.database.get("SheoMus", "emojis_enabled", True)
+
+    # ---------- Properties ----------
+
+    @property
+    def allowed_chats(self):
+        return self.database.get("SheoMus", "allowed_chats", [])
+
+    @allowed_chats.setter
+    def allowed_chats(self, value):
+        self.database.set("SheoMus", "allowed_chats", value)
+
+    @property
+    def music_bots(self):
+        return self.database.get("SheoMus", "music_bots", [])
+
+    @music_bots.setter
+    def music_bots(self, value):
+        self.database.set("SheoMus", "music_bots", value)
+        self.search_cache.clear()
+
+    # ---------- Utilities ----------
+
+    def clock_emoji(self):
+        if self.emojis_enabled:
+            return "<emoji document_id=5330324623613533041>⏰</emoji>"
+        return ""
+
+    def _cleanup(self):
+        now = time.time()
+        if now - self._last_cleanup < CLEANUP_INTERVAL:
+            return
+        self._last_cleanup = now
+
+        for k in [k for k, (_, exp) in self.doc_cache.items() if now > exp]:
+            self.doc_cache.pop(k, None)
+
+        cutoff = now - SPAM_WINDOW * 2
+        self.spam_protection = {
+            k: v for k, v in self.spam_protection.items() if v > cutoff
+        }
+
+        self.search_cache = {
+            k: v
+            for k, v in self.search_cache.items()
+            if now - v[1] < SEARCH_CACHE_TTL * 2
+        }
+
+        self.failed_bots = {
+            k: v for k, v in self.failed_bots.items() if now - v < BOT_FAIL_TTL
+        }
+
+    def _is_forum(self, message):
+        try:
+            rt = getattr(message, "reply_to", None)
+            return bool(rt and getattr(rt, "forum_topic", False))
+        except Exception:
+            return False
+
+    def _get_topic_id(self, message):
+        try:
+            if message is None:
+                return None
+            rt = getattr(message, "reply_to", None)
+            if not rt:
+                return None
+            top = getattr(rt, "reply_to_top_id", None)
+            if top:
+                return top
+            if getattr(rt, "forum_topic", False):
+                return getattr(rt, "reply_to_msg_id", None)
+            return None
+        except Exception:
+            return None
+
+    def _get_chat_id(self, message):
+        try:
+            cid = getattr(message, "chat_id", None)
+            if cid is not None:
+                return str(cid)
+            peer = getattr(message, "peer_id", None)
+            if peer is not None:
+                from telethon.utils import get_peer_id
+
+                return str(get_peer_id(peer))
+            return "0"
+        except Exception:
+            return "0"
+
+    # ---------- Safe I/O ----------
+
+    async def _safe_respond(self, message, text):
+        try:
+            chat_id = message.chat_id
+            topic_id = self._get_topic_id(message)
+            if topic_id:
+                try:
+                    return await self.client.send_message(
+                        chat_id, text, reply_to=topic_id
+                    )
+                except Exception:
+                    pass
+            return await self.client.send_message(chat_id, text)
+        except Exception as e:
+            logger.warning(f"_safe_respond: {e}")
+            return None
+
+    async def _safe_edit(self, message, text):
+        if message is None:
+            return None
+        try:
+            return await message.edit(text)
+        except Exception as e:
+            err = str(e)
+            if (
+                "TOPIC_CLOSED" in err
+                or "TOPIC_DELETED" in err
+                or "MESSAGE_ID_INVALID" in err
+            ):
+                try:
+                    return await self._safe_respond(message, text)
+                except Exception:
+                    return None
+            logger.warning(f"_safe_edit: {e}")
+            return None
+
+    async def _safe_delete(self, message):
+        if message is None:
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    async def delete_after(self, message, seconds):
+        if message is None:
+            return
+        try:
+            await asyncio.sleep(seconds)
+            await self._safe_delete(message)
+        except Exception:
+            pass
+
+    async def _send_track(self, chat_id, document, topic_id=None):
+        try:
+            if topic_id:
+                try:
+                    return await self.client.send_file(
+                        chat_id, document, reply_to=topic_id
+                    )
+                except Exception:
+                    pass
+            return await self.client.send_file(chat_id, document)
+        except Exception as e:
+            logger.error(f"Ошибка отправки трека: {e}")
+            return None
+
+    # ---------- Caches ----------
+
+    def _cache_document(self, document):
+        raw = f"{getattr(document, 'id', 0)}-{time.time()}-{id(document)}"
+        uid = hashlib.md5(raw.encode()).hexdigest()[:16]
+        self.doc_cache[uid] = (document, time.time() + DOC_TTL)
+        return uid
+
+    def _get_cached_document(self, uid):
+        entry = self.doc_cache.get(uid)
+        if not entry:
+            return None
+        document, exp = entry
+        if time.time() > exp:
+            self.doc_cache.pop(uid, None)
+            return None
+        return document
+
+    # ---------- Spam & bot health ----------
+
+    def check_spam(self, user_id):
+        if not user_id:
+            return True
+        self._cleanup()
+        now = time.time()
+        last = self.spam_protection.get(user_id, 0)
+        if now - last < SPAM_WINDOW:
+            return False
+        self.spam_protection[user_id] = now
+        return True
+
+    def is_bot_failed(self, bot_username):
+        ts = self.failed_bots.get(bot_username)
+        if ts is None:
+            return False
+        if time.time() - ts < BOT_FAIL_TTL:
+            return True
+        self.failed_bots.pop(bot_username, None)
+        return False
+
+    def mark_bot_failed(self, bot_username):
+        self.failed_bots[bot_username] = time.time()
+
+    # ---------- Search primitives ----------
+
+    def _is_audio_document(self, doc):
+        try:
+            attrs = getattr(doc, "attributes", []) or []
+            for a in attrs:
+                if isinstance(a, DocumentAttributeAudio):
+                    return True
+            mime = (getattr(doc, "mime_type", "") or "").lower()
+            return mime.startswith("audio/")
+        except Exception:
+            return False
+
+    def _parse_inline_results(self, bot_username, results):
+        if not results:
+            return []
+
+        music_results = []
+        scan_limit = min(len(results), RAW_SCAN_LIMIT)
+
+        for pos in range(scan_limit):
+            if len(music_results) >= RESULTS_PER_BOT:
+                break
+            try:
+                result = results[pos]
+                inner = getattr(result, "result", None)
+                if not inner:
+                    continue
+                doc = getattr(inner, "document", None)
+                if not doc:
+                    continue
+                if not self._is_audio_document(doc):
+                    continue
+
+                raw_title = getattr(inner, "title", "") or ""
+                info = self.extract_track_info_from_document(doc, raw_title)
+                info["bot"] = bot_username
+                info["document"] = doc
+                info["position"] = pos
+                music_results.append(info)
+            except Exception as e:
+                logger.error(f"Обработка результата от @{bot_username}: {e}")
+                continue
+
+        return music_results
+
+    async def _raw_inline_query(self, bot_username, query, timeout):
+        """Один inline_query. Возвращает (results | None, error_str)."""
+        try:
+            results = await asyncio.wait_for(
+                self.client.inline_query(bot_username, query),
+                timeout=timeout,
+            )
+            return results, None
+        except asyncio.TimeoutError:
+            return None, "timeout"
+        except Exception as e:
+            return None, str(e)
+
+    async def search_in_bot(self, bot_username, query):
+        if self.is_bot_failed(bot_username):
+            return []
+
+        results, err = await self._raw_inline_query(
+            bot_username, query, SEARCH_TIMEOUT
+        )
+
+        if err is not None:
+            low = err.lower()
+            if "can't be used in inline mode" in low or "bot can't be used" in low:
+                logger.warning(
+                    f"@{bot_username} не поддерживает инлайн — отключён"
+                )
+                self.mark_bot_failed(bot_username)
+                return []
+            if "wait" in low and "second" in low:
+                logger.debug(
+                    f"@{bot_username} на кулдауне, повтор через "
+                    f"{COOLDOWN_RETRY_DELAY}с"
+                )
+                await asyncio.sleep(COOLDOWN_RETRY_DELAY)
+                results, err2 = await self._raw_inline_query(
+                    bot_username, query, SEARCH_TIMEOUT
+                )
+                if err2 is not None:
+                    logger.debug(f"@{bot_username} повтор не удался: {err2}")
+                    return []
+            else:
+                logger.error(f"Поиск в @{bot_username}: {err}")
+                return []
+
+        return self._parse_inline_results(bot_username, results)
+
+    def _normalize(self, text):
+        if not text:
+            return ""
+        text = text.lower()
+        text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def calculate_relevance_score(self, track_info, query):
+        if not query or not track_info:
+            return 0
+
+        q_norm = self._normalize(query)
+        title = self._normalize(track_info.get("title", ""))
+        performer = self._normalize(track_info.get("performer", ""))
+        raw = self._normalize(track_info.get("raw_title", ""))
+        combined = f"{performer} {title}".strip()
+
+        if not q_norm:
+            return 0
+
+        q_words = [
+            w for w in q_norm.split()
+            if len(w) >= 2 and w not in NOISE_WORDS
+        ]
+        if not q_words:
+            q_words = [w for w in q_norm.split() if len(w) >= 2]
+        if not q_words:
+            return 0
+
+        score = 0
+
+        if q_norm == combined:
+            score += 300
+        if q_norm == title:
+            score += 250
+        if q_norm == performer:
+            score += 180
+
+        if title and q_norm in title:
+            score += 100
+        if performer and q_norm in performer:
+            score += 70
+        if combined and q_norm in combined:
+            score += 60
+        if raw and q_norm in raw:
+            score += 50
+
+        if " - " in query:
+            parts = [self._normalize(p) for p in query.split(" - ", 1)]
+            if len(parts) == 2 and all(parts):
+                a, b = parts
+                if (a in performer and b in title) or (b in performer and a in title):
+                    score += 120
+
+        title_words = set(title.split())
+        perf_words = set(performer.split())
+        raw_words = set(raw.split())
+
+        matched = 0.0
+        for w in q_words:
+            if w in title_words:
+                matched += 1
+                score += 18 if len(w) > 4 else 12
+            elif w in perf_words:
+                matched += 1
+                score += 15
+            elif w in raw_words:
+                matched += 1
+                score += 8
+            elif w in combined:
+                matched += 0.4
+                score += 4
+
+        total = len(q_words)
+        ratio = matched / total if total else 0
+
+        if ratio >= 1.0:
+            score += 60
+        elif ratio >= 0.75:
+            score += 25
+        elif ratio >= 0.5:
+            score += 8
+        elif ratio < 0.4:
+            score -= 30
+
+        if title and len(title_words) > len(q_words) * 3:
+            score -= 10
+
+        if title and performer:
+            score += 8
+
+        return score
+
+    def extract_track_info_from_document(self, document, raw_title=""):
+        if not document:
+            return {"title": "", "performer": "", "raw_title": raw_title}
+
+        title = ""
+        performer = ""
+        filename = ""
+
+        for attr in getattr(document, "attributes", []) or []:
+            if isinstance(attr, DocumentAttributeAudio):
+                if getattr(attr, "title", None):
+                    title = attr.title
+                if getattr(attr, "performer", None):
+                    performer = attr.performer
+            elif isinstance(attr, DocumentAttributeFilename):
+                filename = attr.file_name or ""
+
+        if not title and filename:
+            name = re.sub(
+                r"\.(mp3|m4a|ogg|flac|wav|opus|aac)$",
+                "",
+                filename,
+                flags=re.IGNORECASE,
+            )
+            if " - " in name:
+                parts = name.split(" - ", 1)
+                performer = parts[0].strip()
+                title = parts[1].strip()
+            else:
+                title = name
+
+        return {"title": title, "performer": performer, "raw_title": raw_title}
+
+    def _filter_duplicate_tracks(
+        self, tracks, limit=MAX_RESULTS, per_title_limit=PER_TITLE_LIMIT
+    ):
+        """
+        Дедуп:
+        - точные дубли document_id режем всегда;
+        - один и тот же title допускаем до per_title_limit раз,
+          чтобы в выдаче были треки от разных ботов.
+        """
+        if not tracks:
+            return []
+
+        unique = []
+        seen_doc_ids = set()
+        title_counts = {}
+
+        for track in tracks:
+            doc = track.get("document")
+            doc_id = getattr(doc, "id", None)
+
+            if doc_id and doc_id in seen_doc_ids:
+                continue
+
+            title = self._normalize(track.get("title", ""))
+
+            if title:
+                cnt = title_counts.get(title, 0)
+                if cnt >= per_title_limit:
+                    continue
+                title_counts[title] = cnt + 1
+
+            if doc_id:
+                seen_doc_ids.add(doc_id)
+
+            unique.append(track)
+            if len(unique) >= limit:
+                break
+
+        return unique
+
+    # ---------- Search flows ----------
+
+    async def _gather_search(self, query):
+        """
+        Опрашивает ВСЕХ ботов параллельно.
+        Возвращает результаты от всех, кто успел до SEARCH_TOTAL_TIMEOUT,
+        не теряя их из-за одного медленного.
+        """
+        bots = [b for b in self.music_bots if not self.is_bot_failed(b)]
+        if not bots:
+            return []
+
+        tasks = {
+            asyncio.create_task(self.search_in_bot(b, query)): b for b in bots
+        }
+
+        done, pending = await asyncio.wait(
+            tasks.keys(),
+            timeout=SEARCH_TOTAL_TIMEOUT,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+
+        results = []
+        for t in done:
+            bot = tasks[t]
+            try:
+                r = t.result()
+                if r:
+                    results.append(r)
+            except Exception as e:
+                logger.debug(f"@{bot} ошибка при сборе: {e}")
+
+        for t in pending:
+            bot = tasks[t]
+            logger.warning(
+                f"@{bot} не ответил за {SEARCH_TOTAL_TIMEOUT}с — пропущен"
+            )
+            t.cancel()
+            try:
+                await t
+            except Exception:
+                pass
+
+        return results
+
+    async def search_music(self, query):
+        """Возвращает лучший документ или None (для одиночного поиска)."""
+        if not query:
+            return None
+        query = query.strip()
+        if not query:
+            return None
+
+        results_lists = await self._gather_search(query)
+        if not results_lists:
+            return None
+
+        best_score = -1
+        best_doc = None
+
+        for rlist in results_lists:
+            if not rlist:
+                continue
+            for r in rlist:
+                doc = r.get("document")
+                if not doc:
+                    continue
+                score = self.calculate_relevance_score(r, query)
+                pos = r.get("position", 0)
+                score += max(0, 12 - pos)
+                bot_name = (r.get("bot") or "").lower()
+                score += BOT_WEIGHTS.get(bot_name, 0)
+                if bot_name in PREFERRED_BOTS:
+                    score += 5
+                if score > best_score:
+                    best_score = score
+                    best_doc = doc
+
+        if best_score < 15:
+            return None
+        return best_doc
+
+    async def search_music_inline(self, query):
+        """Возвращает список треков для инлайн-формы."""
+        if not query:
+            return []
+        query = query.strip()
+        if not query:
+            return []
+
+        cache_key = query.lower()
+        cached = self.search_cache.get(cache_key)
+        if cached and time.time() - cached[1] < SEARCH_CACHE_TTL:
+            return cached[0]
+
+        results_lists = await self._gather_search(query)
+        if not results_lists:
+            return []
+
+        all_scored = []
+        for rlist in results_lists:
+            if not rlist:
+                continue
+            for r in rlist:
+                doc = r.get("document")
+                if not doc:
+                    continue
+                score = self.calculate_relevance_score(r, query)
+                pos = r.get("position", 0)
+                score += max(0, 12 - pos)
+                bot_name = (r.get("bot") or "").lower()
+                # только вес бота, без +5 за preferred —
+                # чтобы дать разнообразие источников
+                score += BOT_WEIGHTS.get(bot_name, 0)
+                all_scored.append((score, r))
+
+        if not all_scored:
+            return []
+
+        all_scored.sort(key=lambda x: x[0], reverse=True)
+        tracks = [t for _, t in all_scored]
+        unique = self._filter_duplicate_tracks(
+            tracks, limit=MAX_RESULTS, per_title_limit=PER_TITLE_LIMIT
+        )
+
+        self.search_cache[cache_key] = (unique, time.time())
+        return unique
+
+    # ---------- Inline page building ----------
+
+    async def _build_music_page(self, query, page, chat_id):
+        results = await self.search_music_inline(query)
+        total = len(results)
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+
+        if total == 0:
+            return "Ничего не найдено", [
+                [{"text": "Закрыть", "action": "close"}]
+            ]
+
+        start = page * PAGE_SIZE
+        page_results = results[start : start + PAGE_SIZE]
+
+        buttons = []
+        for i, track in enumerate(page_results, start=start + 1):
+            title = track.get("title", "") or "Неизвестный трек"
+            performer = track.get("performer", "")
+            bot = track.get("bot", "")
+            bot_tag = ""
+            if bot:
+                short = re.sub(r"[_\s]?bot$", "", bot, flags=re.IGNORECASE)
+                if short and short.lower() != bot.lower():
+                    bot_tag = f" [{short}]"
+
+            if performer:
+                name = f"{i}. {performer} - {title}{bot_tag}"
+            else:
+                name = f"{i}. {title}{bot_tag}"
+
+            if len(name) > 45:
+                name = name[:42] + "..."
+
+            uid = self._cache_document(track["document"])
+            buttons.append(
+                [
+                    {
+                        "text": name,
+                        "callback": self._send_music_callback,
+                        "args": (uid, chat_id),
+                    }
+                ]
+            )
+
+        nav = []
+        if page > 0:
+            nav.append(
+                {
+                    "text": "Назад",
+                    "callback": self._page_callback,
+                    "args": (query, page - 1, chat_id),
+                }
+            )
+        if page < total_pages - 1:
+            nav.append(
+                {
+                    "text": "Вперед",
+                    "callback": self._page_callback,
+                    "args": (query, page + 1, chat_id),
+                }
+            )
+        if nav:
+            buttons.append(nav)
+        buttons.append([{"text": "Закрыть", "action": "close"}])
+
+        text = f"Страница {page + 1}/{total_pages} | Найдено: {total}"
+        return text, buttons
+
+    async def _send_music_callback(self, call, uid, chat_id):
+        document = self._get_cached_document(uid)
+        if not document:
+            await call.answer("Трек недоступен, попробуйте заново", show_alert=True)
+            return
+
+        try:
+            await call.answer()
+        except Exception:
+            pass
+
+        try:
+            await call.delete()
+        except Exception:
+            pass
+
+        target = chat_id or getattr(call, "chat_id", None)
+        if target is None:
+            return
+
+        await self._send_track(target, document)
+
+    async def _page_callback(self, call, query, page, chat_id):
+        try:
+            try:
+                await call.answer()
+            except Exception:
+                pass
+            text, buttons = await self._build_music_page(query, page, chat_id)
+            await call.edit(text=text, reply_markup=buttons)
+        except Exception as e:
+            logger.error(f"Ошибка пагинации: {e}")
+            try:
+                await call.answer("Ошибка", show_alert=True)
+            except Exception:
+                pass
+
+    # ---------- Search & send (no inline) ----------
+
+    async def _execute_search_and_send(self, message, query):
+        if not query:
+            return
+
+        chat_id = message.chat_id
+        topic_id = self._get_topic_id(message)
+
+        try:
+            await self._safe_delete(message)
+            status = await self._safe_respond(message, self.clock_emoji())
+
+            doc = await self.search_music(query)
+
+            if status:
+                await self._safe_delete(status)
+
+            if not doc:
+                err = await self._safe_respond(message, "Музыка не найдена")
+                await self.delete_after(err, 3)
+                return
+
+            await self._send_track(chat_id, doc, topic_id)
+        except Exception as e:
+            logger.error(f"_execute_search_and_send: {e}")
+
+    async def _inline_search(self, message, query):
+        chat_id = message.chat_id
+        await self._safe_delete(message)
+
+        prefix = self.clock_emoji()
+        loading_text = prefix if prefix else "..."
+
+        try:
+            loading = await self.client.send_message(chat_id, loading_text)
+        except Exception as e:
+            logger.error(f"_inline_search send loading: {e}")
+            return
+
+        try:
+            text, buttons = await self._build_music_page(query, 0, chat_id)
+            await self.inline.form(
+                text=text,
+                message=loading,
+                reply_markup=buttons,
+                silent=True,
+            )
+        except Exception as e:
+            logger.error(f"_inline_search form: {e}")
+            await self._safe_edit(loading, f"Ошибка: {e}")
+
+    # ---------- Commands ----------
+
+    @loader.command(
+        ru_doc="<название> - Ищет музыку по названию",
+        en_doc="<title> - Search music by title",
+    )
+    async def мcmd(self, message):
+        """Поиск музыки по названию"""
+
+        if not self.check_spam(message.sender_id):
+            await self._safe_delete(message)
+            err = await self._safe_respond(
+                message, "Слишком много запросов, подождите 5 секунд"
+            )
+            await self.delete_after(err, 3)
+            return
+
+        query = utils.get_args_raw(message)
+        if not query:
+            await self._safe_delete(message)
+            err = await self._safe_respond(message, "Укажите название песни")
+            await self.delete_after(err, 3)
+            return
+
+        await self._execute_search_and_send(message, query)
+
+    @loader.command(
+        ru_doc="<название> - Инлайн-поиск с пагинацией",
+        en_doc="<title> - Inline music search with pagination",
+    )
+    async def миcmd(self, message: Message):
+        """Инлайн-поиск музыки"""
+
+        if not self.check_spam(message.sender_id):
+            await self._safe_delete(message)
+            err = await self._safe_respond(
+                message, "Слишком много запросов, подождите 5 секунд"
+            )
+            await self.delete_after(err, 3)
+            return
+
+        query = utils.get_args_raw(message)
+        if not query:
+            err = await self._safe_respond(message, "Укажите название песни")
+            await self.delete_after(err, 3)
+            return
+
+        await self._inline_search(message, query)
+
+    # ---------- Watcher ----------
+
+    async def watcher(self, message):
+        if not message or not message.text:
+            return
+        text = message.text
+        if len(text) < 7:
+            return
+
+        chat_id = self._get_chat_id(message)
+        if chat_id == "0" or chat_id not in self.allowed_chats:
+            return
+
+        lower = text.lower()
+
+        if lower.startswith("найти "):
+            if not self.check_spam(message.sender_id):
+                await self._safe_delete(message)
+                return
+            query = text[6:].strip()
+            if query:
+                await self._execute_search_and_send(message, query)
+
+        elif lower.startswith("найтими "):
+            if not self.check_spam(message.sender_id):
+                await self._safe_delete(message)
+                return
+            query = text[8:].strip()
+            if query:
+                await self._inline_search(message, query)
+
+    # ---------- Admin: allowed chats ----------
+
+    @loader.command(
+        ru_doc="Добавляет текущий чат в список разрешенных",
+        en_doc="Adds current chat to allowed list",
+    )
+    async def addmcmd(self, message):
+        """Добавить чат для работы без префикса"""
+
+        chat_id = self._get_chat_id(message)
+        if chat_id == "0":
+            await self._safe_edit(message, "Не удалось определить ID чата")
+            return
+
+        current = self.allowed_chats
+        if chat_id in current:
+            await self._safe_edit(message, "Этот чат уже в списке разрешенных")
+            return
+
+        current.append(chat_id)
+        self.allowed_chats = current
+        await self._safe_edit(message, f"Чат добавлен. ID: {chat_id}")
+
+    @loader.command(
+        ru_doc="[id] - Удаляет чат из списка разрешенных",
+        en_doc="[id] - Removes chat from allowed list",
+    )
+    async def delmcmd(self, message):
+        """Удалить чат из разрешенных"""
+
+        args = utils.get_args_raw(message)
+        chat_id = args.strip() if args else self._get_chat_id(message)
+
+        if chat_id == "0":
+            await self._safe_edit(message, "Не удалось определить ID чата")
+            return
+
+        current = self.allowed_chats
+        if chat_id not in current:
+            await self._safe_edit(message, "Этот чат не найден в списке")
+            return
+
+        current.remove(chat_id)
+        self.allowed_chats = current
+        await self._safe_edit(message, f"Чат удален. ID: {chat_id}")
+
+    @loader.command(
+        ru_doc="Показывает список разрешенных чатов",
+        en_doc="Shows allowed chats list",
+    )
+    async def listmcmd(self, message):
+        """Список разрешенных чатов"""
+
+        chats = self.allowed_chats
+        if not chats:
+            await self._safe_edit(message, "Список разрешенных чатов пуст")
+            return
+
+        lines = ["Разрешенные чаты:", ""]
+        for cid in chats:
+            try:
+                entity = await self.client.get_entity(int(cid))
+                title = (
+                    getattr(entity, "title", None)
+                    or getattr(entity, "first_name", None)
+                    or "Личные сообщения"
+                )
+                lines.append(f"- {title} ({cid})")
+            except Exception:
+                lines.append(f"- Неизвестный чат ({cid})")
+
+        await self._safe_edit(message, "\n".join(lines))
+
+    # ---------- Admin: bots ----------
+
+    @loader.command(
+        ru_doc="Показывает список ботов для поиска музыки",
+        en_doc="Shows music search bots",
+    )
+    async def botsmcmd(self, message):
+        """Список ботов для поиска"""
+
+        bots = self.music_bots
+        if not bots:
+            await self._safe_edit(message, "Список ботов пуст")
+            return
+
+        lines = ["Боты для поиска музыки:", ""]
+        for i, b in enumerate(bots, 1):
+            status = " (недоступен)" if self.is_bot_failed(b) else ""
+            lines.append(f"{i}. @{b}{status}")
+
+        await self._safe_edit(message, "\n".join(lines))
+
+    @loader.command(
+        ru_doc="<юзернейм> - Добавляет бота в список",
+        en_doc="<username> - Adds bot to search list",
+    )
+    async def addbotmcmd(self, message):
+        """Добавить бота для поиска"""
+
+        args = utils.get_args_raw(message)
+        if not args:
+            await self._safe_edit(message, "Укажите username бота")
+            return
+
+        bot = args.replace("@", "").strip().lower()
+        if not bot:
+            await self._safe_edit(message, "Некорректный username")
+            return
+
+        existing = [b.lower() for b in self.music_bots]
+        if bot in existing:
+            await self._safe_edit(message, "Этот бот уже в списке")
+            return
+
+        current = self.music_bots
+        current.append(bot)
+        self.music_bots = current
+        await self._safe_edit(message, f"Бот @{bot} добавлен в список")
+
+    @loader.command(
+        ru_doc="<юзернейм> - Удаляет бота из списка",
+        en_doc="<username> - Removes bot from list",
+    )
+    async def delbotmcmd(self, message):
+        """Удалить бота из поиска"""
+
+        args = utils.get_args_raw(message)
+        if not args:
+            await self._safe_edit(message, "Укажите username бота")
+            return
+
+        bot = args.replace("@", "").strip().lower()
+        current = self.music_bots
+        new_list = [b for b in current if b.lower() != bot]
+
+        if len(new_list) == len(current):
+            await self._safe_edit(message, "Этот бот не найден в списке")
+            return
+
+        self.music_bots = new_list
+        self.failed_bots.pop(bot, None)
+        await self._safe_edit(message, f"Бот @{bot} удален из списка")
+
+    @loader.command(
+        ru_doc="Сбрасывает список ботов к исходному",
+        en_doc="Resets bot list to default",
+    )
+    async def resetbotsmcmd(self, message):
+        """Сброс списка ботов к дефолтному"""
+
+        current = [b.lower() for b in self.music_bots]
+        default = [b.lower() for b in DEFAULT_BOTS]
+
+        if current == default:
+            await self._safe_edit(message, "Список ботов уже соответствует исходному")
+            return
+
+        self.music_bots = DEFAULT_BOTS.copy()
+        self.failed_bots.clear()
+
+        lines = ["Список ботов сброшен:", ""]
+        for i, b in enumerate(DEFAULT_BOTS, 1):
+            lines.append(f"{i}. @{b}")
+        lines.append("")
+        lines.append("Все боты разблокированы")
+        await self._safe_edit(message, "\n".join(lines))
+
+    # ---------- Admin: emoji toggle ----------
+
+    @loader.command(
+        ru_doc="Включает/выключает эмодзи с котом",
+        en_doc="Toggles cat emoji on/off",
+    )
+    async def котмcmd(self, message):
+        """Вкл/Выкл эмодзи"""
+
+        self.emojis_enabled = not self.emojis_enabled
+        self.database.set("SheoMus", "emojis_enabled", self.emojis_enabled)
+
+        if self.emojis_enabled:
+            await self._safe_edit(
+                message, f"{self.clock_emoji()} Эмодзи включены"
+            )
+        else:
+            await self._safe_edit(message, "Эмодзи выключены")
