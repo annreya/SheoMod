@@ -703,7 +703,7 @@ class SheoMusMod(loader.Module):
         if not user_id:
             return
         key = f"prefs_{user_id}"
-        prefs = self.database.get(key, {}) or {}
+        prefs = self.database.get("SheoMus", key, {}) or {}
         if not isinstance(prefs, dict):
             prefs = {}
         b = bot_name.lower()
@@ -711,7 +711,7 @@ class SheoMusMod(loader.Module):
         if len(prefs) > 30:
             items = sorted(prefs.items(), key=lambda x: x[1], reverse=True)[:30]
             prefs = dict(items)
-        self.database.set(key, prefs)
+        self.database.set("SheoMus", key, prefs)
 
     async def search_music(self, query):
         if not query:
@@ -1496,7 +1496,7 @@ class SheoMusMod(loader.Module):
         for i, q in enumerate(hist, 1):
             lines.append(f"{i}. {q}")
         lines.append("")
-        lines.append("Используйте .история + номер чтобы повторить")
+        lines.append("Используйте .история <N> чтобы повторить")
         await self._safe_edit(message, "\n".join(lines))
 
     @loader.command(
