@@ -80,6 +80,9 @@ MAX_CONCURRENT_INLINE = 8
 
 HISTORY_LIMIT = 20
 
+# Треки короче этой длительности (в секундах) отбрасываются
+MIN_DURATION = 60
+
 
 class SheoMusMod(loader.Module):
     """Мультипоиск музыки"""
@@ -386,12 +389,19 @@ class SheoMusMod(loader.Module):
                 if not self._is_audio_document(doc):
                     continue
 
+                duration = self._doc_duration(doc)
+
+                # Отбрасываем треки короче MIN_DURATION
+                # (если длительность известна и меньше порога)
+                if duration and duration < MIN_DURATION:
+                    continue
+
                 raw_title = getattr(inner, "title", "") or ""
                 info = self.extract_track_info_from_document(doc, raw_title)
                 info["bot"] = bot_username
                 info["document"] = doc
                 info["position"] = pos
-                info["duration"] = self._doc_duration(doc)
+                info["duration"] = duration
                 info["bitrate"] = self._doc_bitrate(doc)
                 info["size"] = getattr(doc, "size", 0) or 0
                 info["mime"] = getattr(doc, "mime_type", "") or ""
@@ -540,8 +550,6 @@ class SheoMusMod(loader.Module):
                 score += 10
             elif dur > 1200:
                 score -= 25
-            elif dur < 45:
-                score -= 15
 
         br = track_info.get("bitrate", 0) or 0
         if br:
@@ -724,14 +732,14 @@ class SheoMusMod(loader.Module):
             return None
         return best_doc
 
-    async def search_music_inline(self, query, user_id=None, sort="relevance", bot_filter=None):
+    async def search_music_inline(self, query, user_id=None, bot_filter=None):
         if not query:
             return []
         query = query.strip()
         if not query:
             return []
 
-        cache_key = f"{query.lower()}|{sort}|{bot_filter or ''}"
+        cache_key = f"{query.lower()}|{bot_filter or ''}"
         cached = self.search_cache.get(cache_key)
         if cached and time.time() - cached[1] < SEARCH_CACHE_TTL:
             return cached[0]
@@ -763,12 +771,7 @@ class SheoMusMod(loader.Module):
         if not all_scored:
             return []
 
-        if sort == "duration":
-            all_scored.sort(key=lambda x: (x[1].get("duration") or 0))
-        elif sort == "bitrate":
-            all_scored.sort(key=lambda x: (-(x[1].get("bitrate") or 0), -x[0]))
-        else:
-            all_scored.sort(key=lambda x: x[0], reverse=True)
+        all_scored.sort(key=lambda x: x[0], reverse=True)
 
         tracks = [t for _, t in all_scored]
         unique = self._filter_duplicate_tracks(
@@ -801,11 +804,10 @@ class SheoMusMod(loader.Module):
     # ==================== Inline page building ====================
 
     async def _build_music_page(
-        self, query, page, chat_id, user_id=None,
-        sort="relevance", bot_filter=None,
+        self, query, page, chat_id, user_id=None, bot_filter=None,
     ):
         results = await self.search_music_inline(
-            query, user_id=user_id, sort=sort, bot_filter=bot_filter
+            query, user_id=user_id, bot_filter=bot_filter
         )
         total = len(results)
         total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -860,13 +862,13 @@ class SheoMusMod(loader.Module):
             nav.append({
                 "text": "Назад",
                 "callback": self._page_callback,
-                "args": (query, page - 1, chat_id, user_id, sort, bot_filter),
+                "args": (query, page - 1, chat_id, user_id, bot_filter),
             })
         if page < total_pages - 1:
             nav.append({
                 "text": "Вперед",
                 "callback": self._page_callback,
-                "args": (query, page + 1, chat_id, user_id, sort, bot_filter),
+                "args": (query, page + 1, chat_id, user_id, bot_filter),
             })
         if nav:
             buttons.append(nav)
@@ -875,27 +877,14 @@ class SheoMusMod(loader.Module):
             {
                 "text": "Все альбомом",
                 "callback": self._album_page_callback,
-                "args": (query, page, chat_id, user_id, sort, bot_filter),
+                "args": (query, page, chat_id, user_id, bot_filter),
             },
         ])
-
-        sort_row = []
-        for label, key in (("По релевантности", "relevance"),
-                           ("По длительности", "duration"),
-                           ("По битрейту", "bitrate")):
-            mark = "• " if key == sort else ""
-            sort_row.append({
-                "text": f"{mark}{label}",
-                "callback": self._page_callback,
-                "args": (query, 0, chat_id, user_id, key, bot_filter),
-            })
-        buttons.append(sort_row)
 
         buttons.append([{"text": "Закрыть", "action": "close"}])
 
         text = (
-            f"Страница {page + 1}/{total_pages} | Найдено: {total}\n"
-            f"Сортировка: {sort}"
+            f"Страница {page + 1}/{total_pages} | Найдено: {total}"
             + (f" | Фильтр: @{bot_filter}" if bot_filter else "")
         )
         return text, buttons
@@ -955,14 +944,14 @@ class SheoMusMod(loader.Module):
             pass
 
     async def _page_callback(self, call, query, page, chat_id, user_id=None,
-                             sort="relevance", bot_filter=None):
+                             bot_filter=None):
         try:
             try:
                 await call.answer()
             except Exception:
                 pass
             text, buttons = await self._build_music_page(
-                query, page, chat_id, user_id, sort, bot_filter
+                query, page, chat_id, user_id, bot_filter
             )
             await call.edit(text=text, reply_markup=buttons)
         except Exception as e:
@@ -973,14 +962,14 @@ class SheoMusMod(loader.Module):
                 pass
 
     async def _album_page_callback(self, call, query, page, chat_id, user_id=None,
-                                   sort="relevance", bot_filter=None):
+                                   bot_filter=None):
         try:
             await call.answer()
         except Exception:
             pass
 
         results = await self.search_music_inline(
-            query, user_id=user_id, sort=sort, bot_filter=bot_filter
+            query, user_id=user_id, bot_filter=bot_filter
         )
         start = page * PAGE_SIZE
         page_results = results[start : start + PAGE_SIZE]
