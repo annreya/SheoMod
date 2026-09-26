@@ -1,0 +1,170 @@
+
+# meta developer: @sheomod
+# meta banner: https://t.me/sheoblockbot
+
+from .. import loader, utils
+import asyncio
+import time
+import re
+import logging
+from telethon import events
+
+logger = logging.getLogger("sheoblock")
+
+
+BOT_USERNAME = "@sheoblockbot"
+WAIT_TIMEOUT = 15          # сколько ждать ответа от бота (сек)
+CLICK_DELAY = 0.8         # пауза между шагами
+FRESH_MSG_AGE = 10        # насколько "свежим" должно быть последнее сообщение
+
+
+@loader.tds
+class SheoBlockMod(loader.Module):
+    """Автоматизация @sheoblockbot"""
+
+    strings = {"name": "SheoBlock"}
+
+    def __init__(self):
+        self.client = None
+        super().__init__()
+
+    async def client_ready(self, client, database):
+        self.client = client
+
+    # ==================== Helpers ====================
+
+    async def _safe_delete(self, message):
+        if message is None:
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    async def _safe_edit(self, message, text):
+        if message is None:
+            return
+        try:
+            await message.edit(text)
+        except Exception:
+            pass
+
+    async def _click_button_by_pattern(self, message, pattern):
+        """Кликает первую кнопку на сообщении, чей текст матчит regex."""
+        buttons = getattr(message, "buttons", None)
+        if not buttons:
+            return False
+
+        rx = re.compile(pattern, re.IGNORECASE)
+        for row in buttons:
+            for btn in row:
+                text = getattr(btn, "text", "") or ""
+                if rx.search(text):
+                    try:
+                        await btn.click()
+                        return True
+                    except Exception as e:
+                        logger.error(f"click button error: {e}")
+                        return False
+        return False
+
+    async def _wait_for_button(self, entity, pattern, timeout=WAIT_TIMEOUT):
+        """
+        Ждёт сообщение от бота с кнопкой, матчащей regex, и кликает её.
+        1) сначала проверяет последнее свежее сообщение (вдруг уже пришло),
+        2) затем слушает новые сообщения до таймаута.
+        """
+        # 1) Проверяем последнее сообщение — вдруг бот уже ответил
+        try:
+            async for m in self.client.iter_messages(entity, limit=1):
+                if not m or not m.buttons:
+                    break
+                ts = getattr(m, "date", None)
+                if ts and (time.time() - ts.timestamp()) < FRESH_MSG_AGE:
+                    if await self._click_button_by_pattern(m, pattern):
+                        return True
+        except Exception as e:
+            logger.debug(f"iter_messages check failed: {e}")
+
+        # 2) Ждём новое сообщение
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            try:
+                msg = await self.client.wait_for(
+                    events.NewMessage(chats=entity, incoming=True),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                return False
+            except Exception as e:
+                logger.error(f"wait_for error: {e}")
+                return False
+
+            if not msg or not msg.buttons:
+                continue
+
+            if await self._click_button_by_pattern(msg, pattern):
+                return True
+
+    # ==================== Main command ====================
+
+    @loader.command(
+        ru_doc="<номер> [текст] - Блокает вход в акк",
+        en_doc="<number> [text] - Runs number through @sheoblockbot choosing 'month'",
+    )
+    async def блокcmd(self, message):
+        """Отправить номер в @sheoblockbot"""
+        args = utils.get_args_raw(message)
+        if not args or not args.strip():
+            err = await message.respond("Укажите номер: .блок <номер> [команда]")
+            await asyncio.sleep(3)
+            await self._safe_delete(err)
+            await self._safe_delete(message)
+            return
+
+        payload = args.strip()
+        chat_id = message.chat_id
+
+        # Удаляем команду пользователя
+        await self._safe_delete(message)
+
+        # Статусное сообщение
+        try:
+            status = await self.client.send_message(chat_id, "...")
+        except Exception as e:
+            logger.error(f"send status failed: {e}")
+            return
+
+        try:
+            # Резолвим бота
+            try:
+                entity = await self.client.get_entity(BOT_USERNAME)
+            except Exception as e:
+                raise RuntimeError(f"Не удалось найти бота {BOT_USERNAME}: {e}")
+
+            # 1) /start
+            await self.client.send_message(entity, "/start")
+            await asyncio.sleep(CLICK_DELAY)
+
+            # 2) Кнопка «Запустить отправку»
+            if not await self._wait_for_button(entity, r"запуст"):
+                raise RuntimeError("Кнопка «Запустить отправку» не найдена")
+
+            await asyncio.sleep(CLICK_DELAY)
+
+            # 3) Отправляем номер + команду
+            await self.client.send_message(entity, payload)
+            await asyncio.sleep(CLICK_DELAY)
+
+            # 4) Кнопка «месяц»
+            if not await self._wait_for_button(entity, r"месяц"):
+                raise RuntimeError("Кнопка «месяц» не найдена")
+
+            await self._safe_edit(status, "Готово")
+
+        except Exception as e:
+            logger.exception("sheoblock flow error")
+            await self._safe_edit(status, f"Ошибка: {e}")
