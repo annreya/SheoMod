@@ -912,6 +912,7 @@ class SheoMusMod(loader.Module):
             await call.answer()
         except Exception:
             pass
+
         try:
             await call.delete()
         except Exception:
@@ -921,6 +922,7 @@ class SheoMusMod(loader.Module):
             return
 
         await self._send_track(target, document)
+
         if meta and meta.get("bot") and user_id:
             self._bump_preference(user_id, meta["bot"])
 
@@ -1455,7 +1457,6 @@ class SheoMusMod(loader.Module):
         args = args.strip() if args else ""
 
         if args:
-            # .бот + username
             if args.startswith("+"):
                 bot = args[1:].strip().replace("@", "").lower()
                 if not bot:
@@ -1474,7 +1475,6 @@ class SheoMusMod(loader.Module):
                 await self.delete_after(err, 3)
                 return
 
-            # .бот - username
             if args.startswith("-"):
                 bot = args[1:].strip().replace("@", "").lower()
                 if not bot:
@@ -1493,7 +1493,6 @@ class SheoMusMod(loader.Module):
                 await self.delete_after(err, 3)
                 return
 
-            # .бот reset
             if args.lower() == "reset":
                 self.music_bots = DEFAULT_BOTS.copy()
                 self.failed_bots.clear()
@@ -1511,7 +1510,6 @@ class SheoMusMod(loader.Module):
             await self.delete_after(err, 5)
             return
 
-        # .бот без аргументов — открываем форму
         await self._safe_delete(message)
 
         try:
@@ -1562,421 +1560,6 @@ class SheoMusMod(loader.Module):
             query = text[8:].strip()
             if query:
                 await self._inline_search(message, query)
-
-    # ==================== Admin: emoji toggle ====================
-
-    @loader.command(
-        ru_doc="Включает/выключает эмодзи с котом",
-        en_doc="Toggles cat emoji on/off",
-    )
-    async def котмcmd(self, message):
-        """Вкл/Выкл эмодзи"""
-        self.emojis_enabled = not self.emojis_enabled
-        self.database.set("SheoMus", "emojis_enabled", self.emojis_enabled)
-
-        if self.emojis_enabled:
-            await self._safe_edit(message, f"{self.clock_emoji()} Эмодзи включены")
-        else:
-            await self._safe_edit(message, "Эмодзи выключены")
-                pass
-            return
-
-        self.music_bots = new_list
-        self.failed_bots.pop(bot, None)
-
-        try:
-            await call.answer("Бот удален", show_alert=False)
-        except Exception:
-            pass
-
-        text, buttons = await self._build_bots_page()
-        try:
-            await call.edit(text=text, reply_markup=buttons)
-        except Exception as e:
-            logger.error(f"bots form edit (del): {e}")
-
-    async def _bot_reset_callback(self, call):
-        current = [b.lower() for b in self.music_bots]
-        default = [b.lower() for b in DEFAULT_BOTS]
-
-        if current == default:
-            try:
-                await call.answer("Список уже соответствует исходному", show_alert=False)
-            except Exception:
-                pass
-            return
-
-        self.music_bots = DEFAULT_BOTS.copy()
-        self.failed_bots.clear()
-
-        try:
-            await call.answer("Список ботов сброшен", show_alert=False)
-        except Exception:
-            pass
-
-        text, buttons = await self._build_bots_page()
-        try:
-            await call.edit(text=text, reply_markup=buttons)
-        except Exception as e:
-            logger.error(f"bots form edit (reset): {e}")
-
-    # ==================== Search & send (no inline) ====================
-
-    async def _execute_search_and_send(self, message, query):
-        if not query:
-            return
-
-        chat_id = message.chat_id
-        topic_id = self._get_topic_id(message)
-        user_id = message.sender_id
-
-        try:
-            await self._safe_delete(message)
-            status = await self._safe_respond(message, self.clock_emoji())
-
-            self._add_history(user_id, query)
-
-            doc = await self.search_music(query)
-
-            if status:
-                await self._safe_delete(status)
-
-            if not doc:
-                err = await self._safe_respond(message, "Музыка не найдена")
-                await self.delete_after(err, 3)
-                return
-
-            doc_id = getattr(doc, "id", None)
-            if doc_id and self._sent_recently(chat_id, doc_id):
-                err = await self._safe_respond(message, "Этот трек уже недавно отправлялся")
-                await self.delete_after(err, 3)
-                return
-
-            msg = await self._send_track(chat_id, doc, topic_id)
-            if msg and doc_id:
-                self._mark_sent(chat_id, doc_id)
-        except Exception as e:
-            logger.error(f"_execute_search_and_send: {e}")
-
-    async def _inline_search(self, message, query):
-        chat_id = message.chat_id
-        user_id = message.sender_id
-        await self._safe_delete(message)
-
-        self._add_history(user_id, query)
-
-        prefix = self.clock_emoji()
-        loading_text = prefix if prefix else "..."
-
-        try:
-            loading = await self.client.send_message(chat_id, loading_text)
-        except Exception as e:
-            logger.error(f"_inline_search send loading: {e}")
-            return
-
-        try:
-            text, buttons = await self._build_music_page(query, 0, chat_id, user_id)
-            await self.inline.form(
-                text=text,
-                message=loading,
-                reply_markup=buttons,
-                silent=True,
-            )
-        except Exception as e:
-            logger.error(f"_inline_search form: {e}")
-            await self._safe_edit(loading, f"Ошибка: {e}")
-
-    # ==================== Background tasks ====================
-
-    async def _background_cleanup(self):
-        while not self._shutdown:
-            try:
-                await asyncio.sleep(CLEANUP_INTERVAL)
-                self._cleanup()
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.error(f"cleanup task: {e}")
-
-    def _cleanup(self):
-        now = time.time()
-
-        for k in [k for k, (_, exp, _m) in self.doc_cache.items() if now > exp]:
-            self.doc_cache.pop(k, None)
-
-        cutoff = now - SPAM_WINDOW * 2
-        self.spam_protection = {
-            k: v for k, v in self.spam_protection.items() if v > cutoff
-        }
-
-        self.search_cache = {
-            k: v for k, v in self.search_cache.items()
-            if now - v[1] < SEARCH_CACHE_TTL * 2
-        }
-
-        for bot in list(self.failed_bots.keys()):
-            if not self.is_bot_failed(bot):
-                pass
-
-        for cid in list(self.sent_cache.keys()):
-            bucket = self.sent_cache[cid]
-            self.sent_cache[cid] = {
-                k: v for k, v in bucket.items() if now - v <= SENT_CACHE_TTL
-            }
-            if not self.sent_cache[cid]:
-                self.sent_cache.pop(cid, None)
-
-    async def _background_healthcheck(self):
-        await asyncio.sleep(30)
-        while not self._shutdown:
-            try:
-                bots = self.music_bots
-                for bot in bots:
-                    if self._shutdown:
-                        return
-                    if self.is_bot_failed(bot):
-                        continue
-                    try:
-                        async with self._inline_sem:
-                            await asyncio.wait_for(
-                                self.client.inline_query(bot, "test"),
-                                timeout=5.0,
-                            )
-                        self.mark_bot_ok(bot)
-                    except Exception as e:
-                        err = str(e).lower()
-                        if "can't be used in inline mode" in err:
-                            self.mark_bot_failed(bot)
-                await asyncio.sleep(HEALTHCHECK_INTERVAL)
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.error(f"healthcheck task: {e}")
-                await asyncio.sleep(300)
-
-    # ==================== Commands ====================
-
-    @loader.command(
-        ru_doc="<название> - Ищет музыку по названию",
-        en_doc="<title> - Search music by title",
-    )
-    async def мcmd(self, message):
-        """Поиск музыки по названию"""
-        if not self.check_spam(message.sender_id):
-            await self._safe_delete(message)
-            err = await self._safe_respond(message, "Слишком много запросов, подождите 5 секунд")
-            await self.delete_after(err, 3)
-            return
-
-        query = utils.get_args_raw(message)
-        if not query:
-            await self._safe_delete(message)
-            err = await self._safe_respond(message, "Укажите название песни")
-            await self.delete_after(err, 3)
-            return
-
-        await self._execute_search_and_send(message, query)
-
-    @loader.command(
-        ru_doc="<название или ссылка> - Инлайн-поиск с пагинацией",
-        en_doc="<title or URL> - Inline music search with pagination",
-    )
-    async def миcmd(self, message: Message):
-        """Инлайн-поиск музыки"""
-        if not self.check_spam(message.sender_id):
-            await self._safe_delete(message)
-            err = await self._safe_respond(message, "Слишком много запросов, подождите 5 секунд")
-            await self.delete_after(err, 3)
-            return
-
-        query = utils.get_args_raw(message)
-        if not query:
-            err = await self._safe_respond(message, "Укажите название песни")
-            await self.delete_after(err, 3)
-            return
-
-        await self._inline_search(message, query)
-
-    @loader.command(
-        ru_doc="[N] - Показывает историю или повторяет N-й запрос",
-        en_doc="[N] - Shows history or repeats N-th query",
-    )
-    async def историяcmd(self, message):
-        """История поиска"""
-        args = utils.get_args_raw(message)
-        if args and args.strip().isdigit():
-            n = int(args.strip())
-            hist = self._get_history(message.sender_id)
-            if 1 <= n <= len(hist):
-                await self._execute_search_and_send(message, hist[n - 1])
-                return
-            err = await self._safe_respond(message, f"Запись {n} не найдена")
-            await self.delete_after(err, 3)
-            return
-
-        hist = self._get_history(message.sender_id)
-        if not hist:
-            await self._safe_edit(message, "История пуста")
-            return
-        lines = ["История поиска:", ""]
-        for i, q in enumerate(hist, 1):
-            lines.append(f"{i}. {q}")
-        lines.append("")
-        lines.append("Используйте .история <N> чтобы повторить")
-        await self._safe_edit(message, "\n".join(lines))
-
-    @loader.command(
-        ru_doc="Управление разрешенными чатами (онлайн-кнопки)",
-        en_doc="Manage allowed chats (inline buttons)",
-    )
-    async def чатcmd(self, message):
-        """Управление чатами"""
-        chat_id = self._get_chat_id(message)
-        await self._safe_delete(message)
-
-        try:
-            loading = await self.client.send_message(message.chat_id, "...")
-        except Exception as e:
-            logger.error(f"чат send loading: {e}")
-            return
-
-        try:
-            text, buttons = await self._build_chats_page(chat_id)
-            await self.inline.form(
-                text=text,
-                message=loading,
-                reply_markup=buttons,
-                silent=True,
-            )
-        except Exception as e:
-            logger.error(f"чат form: {e}")
-            await self._safe_edit(loading, f"Ошибка: {e}")
-
-    @loader.command(
-        ru_doc="Управление ботами-поисковиками (онлайн-кнопки)",
-        en_doc="Manage search bots (inline buttons)",
-    )
-    async def ботcmd(self, message):
-        """Управление ботами"""
-        args = utils.get_args_raw(message)
-        args = args.strip() if args else ""
-
-        if args:
-            # .бот + username
-            if args.startswith("+"):
-                bot = args[1:].strip().replace("@", "").lower()
-                if not bot:
-                    err = await self._safe_respond(message, "Укажите username бота")
-                    await self.delete_after(err, 3)
-                    return
-                existing = [b.lower() for b in self.music_bots]
-                if bot in existing:
-                    err = await self._safe_respond(message, "Этот бот уже в списке")
-                    await self.delete_after(err, 3)
-                    return
-                current = self.music_bots
-                current.append(bot)
-                self.music_bots = current
-                err = await self._safe_respond(message, f"Бот @{bot} добавлен")
-                await self.delete_after(err, 3)
-                return
-
-            # .бот - username
-            if args.startswith("-"):
-                bot = args[1:].strip().replace("@", "").lower()
-                if not bot:
-                    err = await self._safe_respond(message, "Укажите username бота")
-                    await self.delete_after(err, 3)
-                    return
-                current = self.music_bots
-                new_list = [b for b in current if b.lower() != bot]
-                if len(new_list) == len(current):
-                    err = await self._safe_respond(message, "Этот бот не найден в списке")
-                    await self.delete_after(err, 3)
-                    return
-                self.music_bots = new_list
-                self.failed_bots.pop(bot, None)
-                err = await self._safe_respond(message, f"Бот @{bot} удален")
-                await self.delete_after(err, 3)
-                return
-
-            # .бот reset
-            if args.lower() == "reset":
-                self.music_bots = DEFAULT_BOTS.copy()
-                self.failed_bots.clear()
-                err = await self._safe_respond(message, "Список ботов сброшен")
-                await self.delete_after(err, 3)
-                return
-
-            err = await self._safe_respond(
-                message,
-                "Используйте:\n.бот — открыть форму\n"
-                ".бот + username — добавить\n"
-                ".бот - username — удалить\n"
-                ".бот reset — сброс",
-            )
-            await self.delete_after(err, 5)
-            return
-
-        # .бот без аргументов — открываем форму
-        await self._safe_delete(message)
-
-        try:
-            loading = await self.client.send_message(message.chat_id, "...")
-        except Exception as e:
-            logger.error(f"бот send loading: {e}")
-            return
-
-        try:
-            text, buttons = await self._build_bots_page()
-            await self.inline.form(
-                text=text,
-                message=loading,
-                reply_markup=buttons,
-                silent=True,
-            )
-        except Exception as e:
-            logger.error(f"бот form: {e}")
-            await self._safe_edit(loading, f"Ошибка: {e}")
-
-    # ==================== Watcher ====================
-
-    async def watcher(self, message):
-        if not message or not message.text:
-            return
-        text = message.text
-        if len(text) < 7:
-            return
-
-        chat_id = self._get_chat_id(message)
-        if chat_id == "0" or chat_id not in self.allowed_chats:
-            return
-
-        lower = text.lower()
-
-        if lower.startswith("найти "):
-            if not self.check_spam(message.sender_id):
-                await self._safe_delete(message)
-                return
-            query = text[6:].strip()
-            if query:
-                await self._execute_search_and_send(message, query)
-
-        elif lower.startswith("найтими "):
-            if not self.check_spam(message.sender_id):
-                await self._safe_delete(message)
-                return
-            query = text[8:].strip()
-            if query:
-                await self._inline_search(message, query)
-
-        elif lower.startswith("похожее "):
-            if not self.check_spam(message.sender_id):
-                await self._safe_delete(message)
-                return
-            query = text[8:].strip()
-            if query:
-                await self._execute_search_and_send(message, query)
 
     # ==================== Admin: emoji toggle ====================
 
