@@ -13,7 +13,7 @@ from telethon.tl.types import (
     DocumentAttributeAudio,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sheomus")
 
 
 DEFAULT_BOTS = [
@@ -27,8 +27,6 @@ DEFAULT_BOTS = [
 
 PREFERRED_BOTS = {"vkmusic_bot", "tgmusicbot", "spotifydownloader_bot"}
 
-# Веса небольшие — только для разрешения ничьих.
-# Не должны перетаскивать весь топ на одного бота.
 BOT_WEIGHTS = {
     "vkmusic_bot": 4,
     "tgmusicbot": 3,
@@ -38,6 +36,9 @@ BOT_WEIGHTS = {
     "lybot": 1,
 }
 
+RU_BOTS = {"vkmusic_bot", "lybot"}
+EN_BOTS = {"spotifydownloader_bot", "loaditbot"}
+
 NOISE_WORDS = {
     "скачать", "download", "минус", "минусовка", "minus",
     "official", "lyrics", "текст", "клип", "clip",
@@ -45,11 +46,26 @@ NOISE_WORDS = {
     "песня", "song", "трек", "track", "music", "музыка",
 }
 
+AD_PATTERNS = [
+    re.compile(r"@[\w_]{3,}", re.IGNORECASE),
+    re.compile(r"t\.me/\S+", re.IGNORECASE),
+    re.compile(r"https?://\S+", re.IGNORECASE),
+    re.compile(r"\bsubscribe\b", re.IGNORECASE),
+    re.compile(r"\bподпишись\b", re.IGNORECASE),
+    re.compile(r"\bподписывайся\b", re.IGNORECASE),
+    re.compile(r"\bреклама\b", re.IGNORECASE),
+    re.compile(r"\bпромокод\b", re.IGNORECASE),
+    re.compile(r"\[[^\]]{0,20}promo[^\]]{0,20}\]", re.IGNORECASE),
+]
+
 PAGE_SIZE = 10
-DOC_TTL = 600
+DOC_TTL = 1800
 BOT_FAIL_TTL = 3600
+BOT_FAIL_MAX = 43200
 SPAM_WINDOW = 5
 CLEANUP_INTERVAL = 60
+HEALTHCHECK_INTERVAL = 1800
+SENT_CACHE_TTL = 3600
 
 SEARCH_TIMEOUT = 6.0
 SEARCH_TOTAL_TIMEOUT = 7.5
@@ -60,8 +76,10 @@ RAW_SCAN_LIMIT = 40
 MAX_RESULTS = 50
 SEARCH_CACHE_TTL = 30
 
-# Максимум треков с одинаковым title (от разных ботов) в выдаче.
 PER_TITLE_LIMIT = 3
+MAX_CONCURRENT_INLINE = 8
+
+HISTORY_LIMIT = 20
 
 
 class SheoMusMod(loader.Module):
@@ -78,6 +96,11 @@ class SheoMusMod(loader.Module):
         self.search_cache = {}
         self.emojis_enabled = True
         self._last_cleanup = time.time()
+        self._cleanup_task = None
+        self._health_task = None
+        self._inline_sem = asyncio.Semaphore(MAX_CONCURRENT_INLINE)
+        self.sent_cache = {}
+        self._shutdown = False
         super().__init__()
 
     async def client_ready(self, client, database):
@@ -89,7 +112,22 @@ class SheoMusMod(loader.Module):
             self.database.set("SheoMus", "music_bots", DEFAULT_BOTS.copy())
         self.emojis_enabled = self.database.get("SheoMus", "emojis_enabled", True)
 
-    # ---------- Properties ----------
+        self._shutdown = False
+        self._cleanup_task = asyncio.create_task(self._background_cleanup())
+        self._health_task = asyncio.create_task(self._background_healthcheck())
+        logger.info("SheoMus: background tasks started")
+
+    async def on_unload(self):
+        self._shutdown = True
+        for t in (self._cleanup_task, self._health_task):
+            if t and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except Exception:
+                    pass
+
+    # ==================== Properties ====================
 
     @property
     def allowed_chats(self):
@@ -108,36 +146,12 @@ class SheoMusMod(loader.Module):
         self.database.set("SheoMus", "music_bots", value)
         self.search_cache.clear()
 
-    # ---------- Utilities ----------
+    # ==================== Utilities ====================
 
     def clock_emoji(self):
         if self.emojis_enabled:
             return "<emoji document_id=5330324623613533041>⏰</emoji>"
         return ""
-
-    def _cleanup(self):
-        now = time.time()
-        if now - self._last_cleanup < CLEANUP_INTERVAL:
-            return
-        self._last_cleanup = now
-
-        for k in [k for k, (_, exp) in self.doc_cache.items() if now > exp]:
-            self.doc_cache.pop(k, None)
-
-        cutoff = now - SPAM_WINDOW * 2
-        self.spam_protection = {
-            k: v for k, v in self.spam_protection.items() if v > cutoff
-        }
-
-        self.search_cache = {
-            k: v
-            for k, v in self.search_cache.items()
-            if now - v[1] < SEARCH_CACHE_TTL * 2
-        }
-
-        self.failed_bots = {
-            k: v for k, v in self.failed_bots.items() if now - v < BOT_FAIL_TTL
-        }
 
     def _is_forum(self, message):
         try:
@@ -170,13 +184,26 @@ class SheoMusMod(loader.Module):
             peer = getattr(message, "peer_id", None)
             if peer is not None:
                 from telethon.utils import get_peer_id
-
                 return str(get_peer_id(peer))
             return "0"
         except Exception:
             return "0"
 
-    # ---------- Safe I/O ----------
+    def _strip_ads(self, text):
+        if not text:
+            return text
+        for pat in AD_PATTERNS:
+            text = pat.sub("", text)
+        text = re.sub(r"\s{2,}", " ", text).strip(" -–—|·•")
+        return text.strip()
+
+    def _is_url(self, text):
+        return bool(re.match(r"^https?://\S+$", text.strip(), re.IGNORECASE))
+
+    def _detect_lang(self, query):
+        return "ru" if re.search(r"[а-яё]", query, re.IGNORECASE) else "en"
+
+    # ==================== Safe I/O ====================
 
     async def _safe_respond(self, message, text):
         try:
@@ -201,11 +228,7 @@ class SheoMusMod(loader.Module):
             return await message.edit(text)
         except Exception as e:
             err = str(e)
-            if (
-                "TOPIC_CLOSED" in err
-                or "TOPIC_DELETED" in err
-                or "MESSAGE_ID_INVALID" in err
-            ):
+            if any(k in err for k in ("TOPIC_CLOSED", "TOPIC_DELETED", "MESSAGE_ID_INVALID")):
                 try:
                     return await self._safe_respond(message, text)
                 except Exception:
@@ -244,30 +267,70 @@ class SheoMusMod(loader.Module):
             logger.error(f"Ошибка отправки трека: {e}")
             return None
 
-    # ---------- Caches ----------
+    async def _send_album(self, chat_id, documents, topic_id=None):
+        docs = [d for d in documents if d]
+        if not docs:
+            return None
+        try:
+            if topic_id:
+                try:
+                    return await self.client.send_file(
+                        chat_id, docs, reply_to=topic_id
+                    )
+                except Exception:
+                    pass
+            return await self.client.send_file(chat_id, docs)
+        except Exception as e:
+            logger.error(f"Ошибка отправки альбома: {e}")
+            return None
 
-    def _cache_document(self, document):
+    # ==================== Caches ====================
+
+    def _cache_document(self, document, meta=None):
         raw = f"{getattr(document, 'id', 0)}-{time.time()}-{id(document)}"
         uid = hashlib.md5(raw.encode()).hexdigest()[:16]
-        self.doc_cache[uid] = (document, time.time() + DOC_TTL)
+        self.doc_cache[uid] = (document, time.time() + DOC_TTL, meta or {})
         return uid
 
     def _get_cached_document(self, uid):
         entry = self.doc_cache.get(uid)
         if not entry:
-            return None
-        document, exp = entry
+            return None, None
+        document, exp, meta = entry
         if time.time() > exp:
             self.doc_cache.pop(uid, None)
-            return None
-        return document
+            return None, None
+        return document, meta
 
-    # ---------- Spam & bot health ----------
+    def _sent_recently(self, chat_id, doc_id):
+        if not doc_id or not chat_id:
+            return False
+        now = time.time()
+        bucket = self.sent_cache.get(str(chat_id), {})
+        ts = bucket.get(doc_id)
+        if ts is None:
+            return False
+        if now - ts > SENT_CACHE_TTL:
+            bucket.pop(doc_id, None)
+            return False
+        return True
+
+    def _mark_sent(self, chat_id, doc_id):
+        if not doc_id or not chat_id:
+            return
+        bucket = self.sent_cache.setdefault(str(chat_id), {})
+        bucket[doc_id] = time.time()
+        if len(bucket) > 500:
+            now = time.time()
+            self.sent_cache[str(chat_id)] = {
+                k: v for k, v in bucket.items() if now - v <= SENT_CACHE_TTL
+            }
+
+    # ==================== Spam & bot health ====================
 
     def check_spam(self, user_id):
         if not user_id:
             return True
-        self._cleanup()
         now = time.time()
         last = self.spam_protection.get(user_id, 0)
         if now - last < SPAM_WINDOW:
@@ -276,29 +339,57 @@ class SheoMusMod(loader.Module):
         return True
 
     def is_bot_failed(self, bot_username):
-        ts = self.failed_bots.get(bot_username)
-        if ts is None:
+        entry = self.failed_bots.get(bot_username)
+        if entry is None:
             return False
-        if time.time() - ts < BOT_FAIL_TTL:
+        ts, cnt = entry
+        ttl = min(BOT_FAIL_TTL * (2 ** (cnt - 1)), BOT_FAIL_MAX)
+        if time.time() - ts < ttl:
             return True
         self.failed_bots.pop(bot_username, None)
         return False
 
     def mark_bot_failed(self, bot_username):
-        self.failed_bots[bot_username] = time.time()
+        entry = self.failed_bots.get(bot_username)
+        if entry is None:
+            self.failed_bots[bot_username] = (time.time(), 1)
+        else:
+            _, cnt = entry
+            self.failed_bots[bot_username] = (time.time(), min(cnt + 1, 8))
 
-    # ---------- Search primitives ----------
+    def mark_bot_ok(self, bot_username):
+        self.failed_bots.pop(bot_username, None)
+
+    # ==================== Search primitives ====================
 
     def _is_audio_document(self, doc):
         try:
-            attrs = getattr(doc, "attributes", []) or []
-            for a in attrs:
+            for a in (getattr(doc, "attributes", []) or []):
                 if isinstance(a, DocumentAttributeAudio):
                     return True
             mime = (getattr(doc, "mime_type", "") or "").lower()
             return mime.startswith("audio/")
         except Exception:
             return False
+
+    def _doc_duration(self, doc):
+        try:
+            for a in (getattr(doc, "attributes", []) or []):
+                if isinstance(a, DocumentAttributeAudio):
+                    return int(getattr(a, "duration", 0) or 0)
+        except Exception:
+            pass
+        return 0
+
+    def _doc_bitrate(self, doc):
+        try:
+            for a in (getattr(doc, "attributes", []) or []):
+                if isinstance(a, DocumentAttributeAudio):
+                    br = getattr(a, "bitrate", None)
+                    return int(br) if br else 0
+        except Exception:
+            pass
+        return 0
 
     def _parse_inline_results(self, bot_username, results):
         if not results:
@@ -326,6 +417,10 @@ class SheoMusMod(loader.Module):
                 info["bot"] = bot_username
                 info["document"] = doc
                 info["position"] = pos
+                info["duration"] = self._doc_duration(doc)
+                info["bitrate"] = self._doc_bitrate(doc)
+                info["size"] = getattr(doc, "size", 0) or 0
+                info["mime"] = getattr(doc, "mime_type", "") or ""
                 music_results.append(info)
             except Exception as e:
                 logger.error(f"Обработка результата от @{bot_username}: {e}")
@@ -334,43 +429,34 @@ class SheoMusMod(loader.Module):
         return music_results
 
     async def _raw_inline_query(self, bot_username, query, timeout):
-        """Один inline_query. Возвращает (results | None, error_str)."""
-        try:
-            results = await asyncio.wait_for(
-                self.client.inline_query(bot_username, query),
-                timeout=timeout,
-            )
-            return results, None
-        except asyncio.TimeoutError:
-            return None, "timeout"
-        except Exception as e:
-            return None, str(e)
+        async with self._inline_sem:
+            try:
+                results = await asyncio.wait_for(
+                    self.client.inline_query(bot_username, query),
+                    timeout=timeout,
+                )
+                return results, None
+            except asyncio.TimeoutError:
+                return None, "timeout"
+            except Exception as e:
+                return None, str(e)
 
     async def search_in_bot(self, bot_username, query):
         if self.is_bot_failed(bot_username):
             return []
 
-        results, err = await self._raw_inline_query(
-            bot_username, query, SEARCH_TIMEOUT
-        )
+        results, err = await self._raw_inline_query(bot_username, query, SEARCH_TIMEOUT)
 
         if err is not None:
             low = err.lower()
             if "can't be used in inline mode" in low or "bot can't be used" in low:
-                logger.warning(
-                    f"@{bot_username} не поддерживает инлайн — отключён"
-                )
+                logger.warning(f"@{bot_username} не поддерживает инлайн — отключён")
                 self.mark_bot_failed(bot_username)
                 return []
             if "wait" in low and "second" in low:
-                logger.debug(
-                    f"@{bot_username} на кулдауне, повтор через "
-                    f"{COOLDOWN_RETRY_DELAY}с"
-                )
+                logger.debug(f"@{bot_username} на кулдауне, повтор через {COOLDOWN_RETRY_DELAY}с")
                 await asyncio.sleep(COOLDOWN_RETRY_DELAY)
-                results, err2 = await self._raw_inline_query(
-                    bot_username, query, SEARCH_TIMEOUT
-                )
+                results, err2 = await self._raw_inline_query(bot_username, query, SEARCH_TIMEOUT)
                 if err2 is not None:
                     logger.debug(f"@{bot_username} повтор не удался: {err2}")
                     return []
@@ -378,7 +464,12 @@ class SheoMusMod(loader.Module):
                 logger.error(f"Поиск в @{bot_username}: {err}")
                 return []
 
-        return self._parse_inline_results(bot_username, results)
+        parsed = self._parse_inline_results(bot_username, results)
+        if parsed:
+            self.mark_bot_ok(bot_username)
+        return parsed
+
+    # ==================== Scoring ====================
 
     def _normalize(self, text):
         if not text:
@@ -401,10 +492,7 @@ class SheoMusMod(loader.Module):
         if not q_norm:
             return 0
 
-        q_words = [
-            w for w in q_norm.split()
-            if len(w) >= 2 and w not in NOISE_WORDS
-        ]
+        q_words = [w for w in q_norm.split() if len(w) >= 2 and w not in NOISE_WORDS]
         if not q_words:
             q_words = [w for w in q_norm.split() if len(w) >= 2]
         if not q_words:
@@ -472,6 +560,24 @@ class SheoMusMod(loader.Module):
         if title and performer:
             score += 8
 
+        dur = track_info.get("duration", 0) or 0
+        if dur:
+            if 90 <= dur <= 480:
+                score += 10
+            elif dur > 1200:
+                score -= 25
+            elif dur < 45:
+                score -= 15
+
+        br = track_info.get("bitrate", 0) or 0
+        if br:
+            if br >= 320:
+                score += 12
+            elif br >= 192:
+                score += 6
+            elif br and br < 128:
+                score -= 8
+
         return score
 
     def extract_track_info_from_document(self, document, raw_title=""):
@@ -494,9 +600,7 @@ class SheoMusMod(loader.Module):
         if not title and filename:
             name = re.sub(
                 r"\.(mp3|m4a|ogg|flac|wav|opus|aac)$",
-                "",
-                filename,
-                flags=re.IGNORECASE,
+                "", filename, flags=re.IGNORECASE,
             )
             if " - " in name:
                 parts = name.split(" - ", 1)
@@ -505,17 +609,11 @@ class SheoMusMod(loader.Module):
             else:
                 title = name
 
+        title = self._strip_ads(title)
+        performer = self._strip_ads(performer)
         return {"title": title, "performer": performer, "raw_title": raw_title}
 
-    def _filter_duplicate_tracks(
-        self, tracks, limit=MAX_RESULTS, per_title_limit=PER_TITLE_LIMIT
-    ):
-        """
-        Дедуп:
-        - точные дубли document_id режем всегда;
-        - один и тот же title допускаем до per_title_limit раз,
-          чтобы в выдаче были треки от разных ботов.
-        """
+    def _filter_duplicate_tracks(self, tracks, limit=MAX_RESULTS, per_title_limit=PER_TITLE_LIMIT):
         if not tracks:
             return []
 
@@ -547,21 +645,14 @@ class SheoMusMod(loader.Module):
 
         return unique
 
-    # ---------- Search flows ----------
+    # ==================== Search flows ====================
 
     async def _gather_search(self, query):
-        """
-        Опрашивает ВСЕХ ботов параллельно.
-        Возвращает результаты от всех, кто успел до SEARCH_TOTAL_TIMEOUT,
-        не теряя их из-за одного медленного.
-        """
         bots = [b for b in self.music_bots if not self.is_bot_failed(b)]
         if not bots:
             return []
 
-        tasks = {
-            asyncio.create_task(self.search_in_bot(b, query)): b for b in bots
-        }
+        tasks = {asyncio.create_task(self.search_in_bot(b, query)): b for b in bots}
 
         done, pending = await asyncio.wait(
             tasks.keys(),
@@ -581,9 +672,7 @@ class SheoMusMod(loader.Module):
 
         for t in pending:
             bot = tasks[t]
-            logger.warning(
-                f"@{bot} не ответил за {SEARCH_TOTAL_TIMEOUT}с — пропущен"
-            )
+            logger.warning(f"@{bot} не ответил за {SEARCH_TOTAL_TIMEOUT}с — пропущен")
             t.cancel()
             try:
                 await t
@@ -592,8 +681,39 @@ class SheoMusMod(loader.Module):
 
         return results
 
+    def _boost_for_query(self, bot_name, query):
+        bonus = 0
+        lang = self._detect_lang(query)
+        b = bot_name.lower()
+        if lang == "ru" and b in RU_BOTS:
+            bonus += 6
+        elif lang == "en" and b in EN_BOTS:
+            bonus += 6
+        return bonus
+
+    def _personal_bonus(self, user_id, bot_name):
+        if not user_id:
+            return 0
+        prefs = self.database.get("SheoMus", f"prefs_{user_id}", {})
+        if not isinstance(prefs, dict):
+            return 0
+        return prefs.get(bot_name.lower(), 0)
+
+    def _bump_preference(self, user_id, bot_name):
+        if not user_id:
+            return
+        key = f"prefs_{user_id}"
+        prefs = self.database.get(key, {}) or {}
+        if not isinstance(prefs, dict):
+            prefs = {}
+        b = bot_name.lower()
+        prefs[b] = min(prefs.get(b, 0) + 1, 50)
+        if len(prefs) > 30:
+            items = sorted(prefs.items(), key=lambda x: x[1], reverse=True)[:30]
+            prefs = dict(items)
+        self.database.set(key, prefs)
+
     async def search_music(self, query):
-        """Возвращает лучший документ или None (для одиночного поиска)."""
         if not query:
             return None
         query = query.strip()
@@ -619,6 +739,7 @@ class SheoMusMod(loader.Module):
                 score += max(0, 12 - pos)
                 bot_name = (r.get("bot") or "").lower()
                 score += BOT_WEIGHTS.get(bot_name, 0)
+                score += self._boost_for_query(bot_name, query)
                 if bot_name in PREFERRED_BOTS:
                     score += 5
                 if score > best_score:
@@ -629,15 +750,14 @@ class SheoMusMod(loader.Module):
             return None
         return best_doc
 
-    async def search_music_inline(self, query):
-        """Возвращает список треков для инлайн-формы."""
+    async def search_music_inline(self, query, user_id=None, sort="relevance", bot_filter=None):
         if not query:
             return []
         query = query.strip()
         if not query:
             return []
 
-        cache_key = query.lower()
+        cache_key = f"{query.lower()}|{sort}|{bot_filter or ''}"
         cached = self.search_cache.get(cache_key)
         if cached and time.time() - cached[1] < SEARCH_CACHE_TTL:
             return cached[0]
@@ -654,19 +774,28 @@ class SheoMusMod(loader.Module):
                 doc = r.get("document")
                 if not doc:
                     continue
+                bot_name = (r.get("bot") or "").lower()
+                if bot_filter and bot_name != bot_filter.lower():
+                    continue
+
                 score = self.calculate_relevance_score(r, query)
                 pos = r.get("position", 0)
                 score += max(0, 12 - pos)
-                bot_name = (r.get("bot") or "").lower()
-                # только вес бота, без +5 за preferred —
-                # чтобы дать разнообразие источников
                 score += BOT_WEIGHTS.get(bot_name, 0)
+                score += self._boost_for_query(bot_name, query)
+                score += self._personal_bonus(user_id, bot_name)
                 all_scored.append((score, r))
 
         if not all_scored:
             return []
 
-        all_scored.sort(key=lambda x: x[0], reverse=True)
+        if sort == "duration":
+            all_scored.sort(key=lambda x: (x[1].get("duration") or 0))
+        elif sort == "bitrate":
+            all_scored.sort(key=lambda x: (-(x[1].get("bitrate") or 0), -x[0]))
+        else:
+            all_scored.sort(key=lambda x: x[0], reverse=True)
+
         tracks = [t for _, t in all_scored]
         unique = self._filter_duplicate_tracks(
             tracks, limit=MAX_RESULTS, per_title_limit=PER_TITLE_LIMIT
@@ -675,18 +804,41 @@ class SheoMusMod(loader.Module):
         self.search_cache[cache_key] = (unique, time.time())
         return unique
 
-    # ---------- Inline page building ----------
+    # ==================== History ====================
 
-    async def _build_music_page(self, query, page, chat_id):
-        results = await self.search_music_inline(query)
+    def _history_key(self, user_id):
+        return f"history_{user_id}"
+
+    def _add_history(self, user_id, query):
+        if not user_id:
+            return
+        key = self._history_key(user_id)
+        hist = self.database.get("SheoMus", key, []) or []
+        if not isinstance(hist, list):
+            hist = []
+        hist = [h for h in hist if h.lower() != query.lower()]
+        hist.insert(0, query)
+        hist = hist[:HISTORY_LIMIT]
+        self.database.set("SheoMus", key, hist)
+
+    def _get_history(self, user_id):
+        return self.database.get("SheoMus", self._history_key(user_id), []) or []
+
+    # ==================== Inline page building ====================
+
+    async def _build_music_page(
+        self, query, page, chat_id, user_id=None,
+        sort="relevance", bot_filter=None,
+    ):
+        results = await self.search_music_inline(
+            query, user_id=user_id, sort=sort, bot_filter=bot_filter
+        )
         total = len(results)
         total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
         page = max(0, min(page, total_pages - 1))
 
         if total == 0:
-            return "Ничего не найдено", [
-                [{"text": "Закрыть", "action": "close"}]
-            ]
+            return "Ничего не найдено", [[{"text": "Закрыть", "action": "close"}]]
 
         start = page * PAGE_SIZE
         page_results = results[start : start + PAGE_SIZE]
@@ -710,70 +862,171 @@ class SheoMusMod(loader.Module):
             if len(name) > 45:
                 name = name[:42] + "..."
 
-            uid = self._cache_document(track["document"])
-            buttons.append(
-                [
-                    {
-                        "text": name,
-                        "callback": self._send_music_callback,
-                        "args": (uid, chat_id),
-                    }
-                ]
-            )
+            uid = self._cache_document(track["document"], {
+                "query": query,
+                "bot": bot,
+                "title": title,
+                "performer": performer,
+            })
+            buttons.append([
+                {
+                    "text": name,
+                    "callback": self._send_music_callback,
+                    "args": (uid, chat_id, user_id),
+                },
+                {
+                    "text": "Инфо",
+                    "callback": self._info_callback,
+                    "args": (uid,),
+                },
+            ])
 
         nav = []
         if page > 0:
-            nav.append(
-                {
-                    "text": "Назад",
-                    "callback": self._page_callback,
-                    "args": (query, page - 1, chat_id),
-                }
-            )
+            nav.append({
+                "text": "Назад",
+                "callback": self._page_callback,
+                "args": (query, page - 1, chat_id, user_id, sort, bot_filter),
+            })
         if page < total_pages - 1:
-            nav.append(
-                {
-                    "text": "Вперед",
-                    "callback": self._page_callback,
-                    "args": (query, page + 1, chat_id),
-                }
-            )
+            nav.append({
+                "text": "Вперед",
+                "callback": self._page_callback,
+                "args": (query, page + 1, chat_id, user_id, sort, bot_filter),
+            })
         if nav:
             buttons.append(nav)
+
+        buttons.append([
+            {
+                "text": "Все альбомом",
+                "callback": self._album_page_callback,
+                "args": (query, page, chat_id, user_id, sort, bot_filter),
+            },
+        ])
+
+        sort_row = []
+        for label, key in (("По релевантности", "relevance"),
+                           ("По длительности", "duration"),
+                           ("По битрейту", "bitrate")):
+            mark = "• " if key == sort else ""
+            sort_row.append({
+                "text": f"{mark}{label}",
+                "callback": self._page_callback,
+                "args": (query, 0, chat_id, user_id, key, bot_filter),
+            })
+        buttons.append(sort_row)
+
         buttons.append([{"text": "Закрыть", "action": "close"}])
 
-        text = f"Страница {page + 1}/{total_pages} | Найдено: {total}"
+        text = (
+            f"Страница {page + 1}/{total_pages} | Найдено: {total}\n"
+            f"Сортировка: {sort}"
+            + (f" | Фильтр: @{bot_filter}" if bot_filter else "")
+        )
         return text, buttons
 
-    async def _send_music_callback(self, call, uid, chat_id):
-        document = self._get_cached_document(uid)
+    async def _send_music_callback(self, call, uid, chat_id, user_id=None):
+        document, meta = self._get_cached_document(uid)
         if not document:
             await call.answer("Трек недоступен, попробуйте заново", show_alert=True)
+            return
+
+        doc_id = getattr(document, "id", None)
+        target = chat_id or getattr(call, "chat_id", None)
+
+        if target and doc_id and self._sent_recently(target, doc_id):
+            await call.answer("Этот трек уже недавно отправлялся в этот чат", show_alert=False)
             return
 
         try:
             await call.answer()
         except Exception:
             pass
-
         try:
             await call.delete()
         except Exception:
             pass
 
-        target = chat_id or getattr(call, "chat_id", None)
         if target is None:
             return
 
-        await self._send_track(target, document)
+        msg = await self._send_track(target, document)
+        if msg and doc_id:
+            self._mark_sent(target, doc_id)
+        if meta and meta.get("bot") and user_id:
+            self._bump_preference(user_id, meta["bot"])
 
-    async def _page_callback(self, call, query, page, chat_id):
+        try:
+            performer = (meta or {}).get("performer", "") or ""
+            if performer and msg:
+                await self.inline.form(
+                    text=f"{performer}",
+                    message=msg,
+                    reply_markup=[[{
+                        "text": "Похожее",
+                        "callback": self._similar_callback,
+                        "args": (performer,),
+                    }]],
+                    silent=True,
+                )
+        except Exception as e:
+            logger.debug(f"similar button: {e}")
+
+    async def _similar_callback(self, call, performer):
+        try:
+            await call.answer()
+        except Exception:
+            pass
+        try:
+            await call.delete()
+        except Exception:
+            pass
+        try:
+            await call.answer(
+                f"Используйте: .ми {performer}", show_alert=True
+            )
+        except Exception:
+            pass
+
+    async def _info_callback(self, call, uid):
+        document, meta = self._get_cached_document(uid)
+        if not document:
+            await call.answer("Информация недоступна", show_alert=True)
+            return
+
+        dur = self._doc_duration(document)
+        br = self._doc_bitrate(document)
+        size = (getattr(document, "size", 0) or 0) / 1024 / 1024
+        mime = getattr(document, "mime_type", "") or "?"
+
+        minutes = dur // 60
+        seconds = dur % 60
+        dur_str = f"{minutes}:{seconds:02d}" if dur else "?"
+
+        text = (
+            f"{meta.get('performer', '')} - {meta.get('title', '')}\n"
+            f"@{meta.get('bot', '?')}\n"
+            f"Длительность: {dur_str}\n"
+            f"Битрейт: {br or '?'} kbps\n"
+            f"Размер: {size:.2f} MB\n"
+            f"MIME: {mime}"
+        )
+        try:
+            await call.answer(text, show_alert=True)
+        except Exception:
+            pass
+
+    async def _page_callback(self, call, query, page, chat_id, user_id=None,
+                             sort="relevance", bot_filter=None):
         try:
             try:
                 await call.answer()
             except Exception:
                 pass
-            text, buttons = await self._build_music_page(query, page, chat_id)
+            text, buttons = await self._build_music_page(
+                query, page, chat_id, user_id, sort, bot_filter
+            )
             await call.edit(text=text, reply_markup=buttons)
         except Exception as e:
             logger.error(f"Ошибка пагинации: {e}")
@@ -782,7 +1035,266 @@ class SheoMusMod(loader.Module):
             except Exception:
                 pass
 
-    # ---------- Search & send (no inline) ----------
+    async def _album_page_callback(self, call, query, page, chat_id, user_id=None,
+                                   sort="relevance", bot_filter=None):
+        try:
+            await call.answer()
+        except Exception:
+            pass
+
+        results = await self.search_music_inline(
+            query, user_id=user_id, sort=sort, bot_filter=bot_filter
+        )
+        start = page * PAGE_SIZE
+        page_results = results[start : start + PAGE_SIZE]
+        docs = [t["document"] for t in page_results if t.get("document")]
+        if not docs:
+            try:
+                await call.answer("Нет треков", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        target = chat_id or getattr(call, "chat_id", None)
+        await self._send_album(target, docs)
+        try:
+            await call.answer(f"Отправлено {len(docs)} треков", show_alert=False)
+        except Exception:
+            pass
+
+    # ==================== Chats inline form ====================
+
+    async def _build_chats_page(self, target_chat_id=None):
+        chats = self.allowed_chats
+
+        buttons = []
+        buttons.append([
+            {
+                "text": "Добавить текущий чат",
+                "callback": self._chat_add_callback,
+                "args": (str(target_chat_id) if target_chat_id else "",),
+            }
+        ])
+
+        for cid in chats:
+            try:
+                entity = await self.client.get_entity(int(cid))
+                title = (
+                    getattr(entity, "title", None)
+                    or getattr(entity, "first_name", None)
+                    or "Личные сообщения"
+                )
+            except Exception:
+                title = "Неизвестный чат"
+
+            if len(title) > 24:
+                title = title[:21] + "..."
+
+            buttons.append([
+                {
+                    "text": f"{title} ({cid})",
+                    "callback": self._chat_info_callback,
+                    "args": (cid,),
+                },
+                {
+                    "text": "Удалить",
+                    "callback": self._chat_del_callback,
+                    "args": (cid,),
+                },
+            ])
+
+        buttons.append([{"text": "Закрыть", "action": "close"}])
+
+        if chats:
+            text = f"Разрешенные чаты ({len(chats)}):"
+        else:
+            text = "Список разрешенных чатов пуст"
+
+        return text, buttons
+
+    async def _chat_info_callback(self, call, cid):
+        try:
+            await call.answer(f"ID: {cid}", show_alert=False)
+        except Exception:
+            pass
+
+    async def _chat_add_callback(self, call, target_chat_id):
+        cid = str(target_chat_id) if target_chat_id else ""
+        if not cid or cid == "0":
+            cid = str(getattr(call, "chat_id", "") or "")
+
+        if not cid or cid == "0":
+            try:
+                await call.answer("Не удалось определить ID", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        current = self.allowed_chats
+        added = False
+        if cid not in current:
+            current.append(cid)
+            self.allowed_chats = current
+            added = True
+
+        try:
+            await call.answer(
+                "Чат добавлен" if added else "Этот чат уже в списке",
+                show_alert=False,
+            )
+        except Exception:
+            pass
+
+        text, buttons = await self._build_chats_page(target_chat_id or cid)
+        try:
+            await call.edit(text=text, reply_markup=buttons)
+        except Exception as e:
+            logger.error(f"chat form edit (add): {e}")
+
+    async def _chat_del_callback(self, call, cid):
+        cid = str(cid)
+        current = self.allowed_chats
+        if cid not in current:
+            try:
+                await call.answer("Не найдено", show_alert=False)
+            except Exception:
+                pass
+            return
+
+        current.remove(cid)
+        self.allowed_chats = current
+
+        try:
+            await call.answer("Чат удален", show_alert=False)
+        except Exception:
+            pass
+
+        target_chat_id = str(getattr(call, "chat_id", "") or "")
+        text, buttons = await self._build_chats_page(target_chat_id)
+        try:
+            await call.edit(text=text, reply_markup=buttons)
+        except Exception as e:
+            logger.error(f"chat form edit (del): {e}")
+
+    # ==================== Bots inline form ====================
+
+    async def _build_bots_page(self):
+        bots = self.music_bots
+
+        buttons = []
+        buttons.append([
+            {
+                "text": "Добавить бота",
+                "callback": self._bot_add_hint_callback,
+                "args": (),
+            }
+        ])
+
+        for b in bots:
+            status = " [fail]" if self.is_bot_failed(b) else ""
+            label = f"@{b}{status}"
+            if len(label) > 30:
+                label = label[:27] + "..."
+
+            buttons.append([
+                {
+                    "text": label,
+                    "callback": self._bot_info_callback,
+                    "args": (b,),
+                },
+                {
+                    "text": "Удалить",
+                    "callback": self._bot_del_callback,
+                    "args": (b,),
+                },
+            ])
+
+        buttons.append([
+            {
+                "text": "Сбросить к исходным",
+                "callback": self._bot_reset_callback,
+                "args": (),
+            }
+        ])
+        buttons.append([{"text": "Закрыть", "action": "close"}])
+
+        if bots:
+            text = (
+                f"Боты для поиска музыки ({len(bots)}):\n\n"
+                f"Добавить: .бот + username"
+            )
+        else:
+            text = "Список ботов пуст\n\nДобавить: .бот + username"
+
+        return text, buttons
+
+    async def _bot_info_callback(self, call, bot):
+        status = "недоступен" if self.is_bot_failed(bot) else "ок"
+        try:
+            await call.answer(f"@{bot}: {status}", show_alert=False)
+        except Exception:
+            pass
+
+    async def _bot_add_hint_callback(self, call):
+        try:
+            await call.answer(
+                "Используйте команду:\n.бот + username",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+
+    async def _bot_del_callback(self, call, bot):
+        current = self.music_bots
+        new_list = [b for b in current if b.lower() != bot.lower()]
+
+        if len(new_list) == len(current):
+            try:
+                await call.answer("Не найдено", show_alert=False)
+            except Exception:
+                pass
+            return
+
+        self.music_bots = new_list
+        self.failed_bots.pop(bot, None)
+
+        try:
+            await call.answer("Бот удален", show_alert=False)
+        except Exception:
+            pass
+
+        text, buttons = await self._build_bots_page()
+        try:
+            await call.edit(text=text, reply_markup=buttons)
+        except Exception as e:
+            logger.error(f"bots form edit (del): {e}")
+
+    async def _bot_reset_callback(self, call):
+        current = [b.lower() for b in self.music_bots]
+        default = [b.lower() for b in DEFAULT_BOTS]
+
+        if current == default:
+            try:
+                await call.answer("Список уже соответствует исходному", show_alert=False)
+            except Exception:
+                pass
+            return
+
+        self.music_bots = DEFAULT_BOTS.copy()
+        self.failed_bots.clear()
+
+        try:
+            await call.answer("Список ботов сброшен", show_alert=False)
+        except Exception:
+            pass
+
+        text, buttons = await self._build_bots_page()
+        try:
+            await call.edit(text=text, reply_markup=buttons)
+        except Exception as e:
+            logger.error(f"bots form edit (reset): {e}")
+
+    # ==================== Search & send (no inline) ====================
 
     async def _execute_search_and_send(self, message, query):
         if not query:
@@ -790,10 +1302,13 @@ class SheoMusMod(loader.Module):
 
         chat_id = message.chat_id
         topic_id = self._get_topic_id(message)
+        user_id = message.sender_id
 
         try:
             await self._safe_delete(message)
             status = await self._safe_respond(message, self.clock_emoji())
+
+            self._add_history(user_id, query)
 
             doc = await self.search_music(query)
 
@@ -805,13 +1320,24 @@ class SheoMusMod(loader.Module):
                 await self.delete_after(err, 3)
                 return
 
-            await self._send_track(chat_id, doc, topic_id)
+            doc_id = getattr(doc, "id", None)
+            if doc_id and self._sent_recently(chat_id, doc_id):
+                err = await self._safe_respond(message, "Этот трек уже недавно отправлялся")
+                await self.delete_after(err, 3)
+                return
+
+            msg = await self._send_track(chat_id, doc, topic_id)
+            if msg and doc_id:
+                self._mark_sent(chat_id, doc_id)
         except Exception as e:
             logger.error(f"_execute_search_and_send: {e}")
 
     async def _inline_search(self, message, query):
         chat_id = message.chat_id
+        user_id = message.sender_id
         await self._safe_delete(message)
+
+        self._add_history(user_id, query)
 
         prefix = self.clock_emoji()
         loading_text = prefix if prefix else "..."
@@ -823,7 +1349,7 @@ class SheoMusMod(loader.Module):
             return
 
         try:
-            text, buttons = await self._build_music_page(query, 0, chat_id)
+            text, buttons = await self._build_music_page(query, 0, chat_id, user_id)
             await self.inline.form(
                 text=text,
                 message=loading,
@@ -834,7 +1360,75 @@ class SheoMusMod(loader.Module):
             logger.error(f"_inline_search form: {e}")
             await self._safe_edit(loading, f"Ошибка: {e}")
 
-    # ---------- Commands ----------
+    # ==================== Background tasks ====================
+
+    async def _background_cleanup(self):
+        while not self._shutdown:
+            try:
+                await asyncio.sleep(CLEANUP_INTERVAL)
+                self._cleanup()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"cleanup task: {e}")
+
+    def _cleanup(self):
+        now = time.time()
+
+        for k in [k for k, (_, exp, _m) in self.doc_cache.items() if now > exp]:
+            self.doc_cache.pop(k, None)
+
+        cutoff = now - SPAM_WINDOW * 2
+        self.spam_protection = {
+            k: v for k, v in self.spam_protection.items() if v > cutoff
+        }
+
+        self.search_cache = {
+            k: v for k, v in self.search_cache.items()
+            if now - v[1] < SEARCH_CACHE_TTL * 2
+        }
+
+        for bot in list(self.failed_bots.keys()):
+            if not self.is_bot_failed(bot):
+                pass
+
+        for cid in list(self.sent_cache.keys()):
+            bucket = self.sent_cache[cid]
+            self.sent_cache[cid] = {
+                k: v for k, v in bucket.items() if now - v <= SENT_CACHE_TTL
+            }
+            if not self.sent_cache[cid]:
+                self.sent_cache.pop(cid, None)
+
+    async def _background_healthcheck(self):
+        await asyncio.sleep(30)
+        while not self._shutdown:
+            try:
+                bots = self.music_bots
+                for bot in bots:
+                    if self._shutdown:
+                        return
+                    if self.is_bot_failed(bot):
+                        continue
+                    try:
+                        async with self._inline_sem:
+                            await asyncio.wait_for(
+                                self.client.inline_query(bot, "test"),
+                                timeout=5.0,
+                            )
+                        self.mark_bot_ok(bot)
+                    except Exception as e:
+                        err = str(e).lower()
+                        if "can't be used in inline mode" in err:
+                            self.mark_bot_failed(bot)
+                await asyncio.sleep(HEALTHCHECK_INTERVAL)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"healthcheck task: {e}")
+                await asyncio.sleep(300)
+
+    # ==================== Commands ====================
 
     @loader.command(
         ru_doc="<название> - Ищет музыку по названию",
@@ -842,12 +1436,9 @@ class SheoMusMod(loader.Module):
     )
     async def мcmd(self, message):
         """Поиск музыки по названию"""
-
         if not self.check_spam(message.sender_id):
             await self._safe_delete(message)
-            err = await self._safe_respond(
-                message, "Слишком много запросов, подождите 5 секунд"
-            )
+            err = await self._safe_respond(message, "Слишком много запросов, подождите 5 секунд")
             await self.delete_after(err, 3)
             return
 
@@ -861,17 +1452,14 @@ class SheoMusMod(loader.Module):
         await self._execute_search_and_send(message, query)
 
     @loader.command(
-        ru_doc="<название> - Инлайн-поиск с пагинацией",
-        en_doc="<title> - Inline music search with pagination",
+        ru_doc="<название или ссылка> - Инлайн-поиск с пагинацией",
+        en_doc="<title or URL> - Inline music search with pagination",
     )
     async def миcmd(self, message: Message):
         """Инлайн-поиск музыки"""
-
         if not self.check_spam(message.sender_id):
             await self._safe_delete(message)
-            err = await self._safe_respond(
-                message, "Слишком много запросов, подождите 5 секунд"
-            )
+            err = await self._safe_respond(message, "Слишком много запросов, подождите 5 секунд")
             await self.delete_after(err, 3)
             return
 
@@ -883,7 +1471,149 @@ class SheoMusMod(loader.Module):
 
         await self._inline_search(message, query)
 
-    # ---------- Watcher ----------
+    @loader.command(
+        ru_doc="[N] - Показывает историю или повторяет N-й запрос",
+        en_doc="[N] - Shows history or repeats N-th query",
+    )
+    async def историяcmd(self, message):
+        """История поиска"""
+        args = utils.get_args_raw(message)
+        if args and args.strip().isdigit():
+            n = int(args.strip())
+            hist = self._get_history(message.sender_id)
+            if 1 <= n <= len(hist):
+                await self._execute_search_and_send(message, hist[n - 1])
+                return
+            err = await self._safe_respond(message, f"Запись {n} не найдена")
+            await self.delete_after(err, 3)
+            return
+
+        hist = self._get_history(message.sender_id)
+        if not hist:
+            await self._safe_edit(message, "История пуста")
+            return
+        lines = ["История поиска:", ""]
+        for i, q in enumerate(hist, 1):
+            lines.append(f"{i}. {q}")
+        lines.append("")
+        lines.append("Используйте .история + номер чтобы повторить")
+        await self._safe_edit(message, "\n".join(lines))
+
+    @loader.command(
+        ru_doc="Управление разрешенными чатами (онлайн-кнопки)",
+        en_doc="Manage allowed chats (inline buttons)",
+    )
+    async def чатcmd(self, message):
+        """Управление чатами"""
+        chat_id = self._get_chat_id(message)
+        await self._safe_delete(message)
+
+        try:
+            loading = await self.client.send_message(message.chat_id, "...")
+        except Exception as e:
+            logger.error(f"чат send loading: {e}")
+            return
+
+        try:
+            text, buttons = await self._build_chats_page(chat_id)
+            await self.inline.form(
+                text=text,
+                message=loading,
+                reply_markup=buttons,
+                silent=True,
+            )
+        except Exception as e:
+            logger.error(f"чат form: {e}")
+            await self._safe_edit(loading, f"Ошибка: {e}")
+
+    @loader.command(
+        ru_doc="Управление ботами-поисковиками (онлайн-кнопки)",
+        en_doc="Manage search bots (inline buttons)",
+    )
+    async def ботcmd(self, message):
+        """Управление ботами"""
+        args = utils.get_args_raw(message)
+        args = args.strip() if args else ""
+
+        if args:
+            # .бот + username
+            if args.startswith("+"):
+                bot = args[1:].strip().replace("@", "").lower()
+                if not bot:
+                    err = await self._safe_respond(message, "Укажите username бота")
+                    await self.delete_after(err, 3)
+                    return
+                existing = [b.lower() for b in self.music_bots]
+                if bot in existing:
+                    err = await self._safe_respond(message, "Этот бот уже в списке")
+                    await self.delete_after(err, 3)
+                    return
+                current = self.music_bots
+                current.append(bot)
+                self.music_bots = current
+                err = await self._safe_respond(message, f"Бот @{bot} добавлен")
+                await self.delete_after(err, 3)
+                return
+
+            # .бот - username
+            if args.startswith("-"):
+                bot = args[1:].strip().replace("@", "").lower()
+                if not bot:
+                    err = await self._safe_respond(message, "Укажите username бота")
+                    await self.delete_after(err, 3)
+                    return
+                current = self.music_bots
+                new_list = [b for b in current if b.lower() != bot]
+                if len(new_list) == len(current):
+                    err = await self._safe_respond(message, "Этот бот не найден в списке")
+                    await self.delete_after(err, 3)
+                    return
+                self.music_bots = new_list
+                self.failed_bots.pop(bot, None)
+                err = await self._safe_respond(message, f"Бот @{bot} удален")
+                await self.delete_after(err, 3)
+                return
+
+            # .бот reset
+            if args.lower() == "reset":
+                self.music_bots = DEFAULT_BOTS.copy()
+                self.failed_bots.clear()
+                err = await self._safe_respond(message, "Список ботов сброшен")
+                await self.delete_after(err, 3)
+                return
+
+            err = await self._safe_respond(
+                message,
+                "Используйте:\n.бот — открыть форму\n"
+                ".бот + username — добавить\n"
+                ".бот - username — удалить\n"
+                ".бот reset — сброс",
+            )
+            await self.delete_after(err, 5)
+            return
+
+        # .бот без аргументов — открываем форму
+        await self._safe_delete(message)
+
+        try:
+            loading = await self.client.send_message(message.chat_id, "...")
+        except Exception as e:
+            logger.error(f"бот send loading: {e}")
+            return
+
+        try:
+            text, buttons = await self._build_bots_page()
+            await self.inline.form(
+                text=text,
+                message=loading,
+                reply_markup=buttons,
+                silent=True,
+            )
+        except Exception as e:
+            logger.error(f"бот form: {e}")
+            await self._safe_edit(loading, f"Ошибка: {e}")
+
+    # ==================== Watcher ====================
 
     async def watcher(self, message):
         if not message or not message.text:
@@ -914,176 +1644,15 @@ class SheoMusMod(loader.Module):
             if query:
                 await self._inline_search(message, query)
 
-    # ---------- Admin: allowed chats ----------
+        elif lower.startswith("похожее "):
+            if not self.check_spam(message.sender_id):
+                await self._safe_delete(message)
+                return
+            query = text[8:].strip()
+            if query:
+                await self._execute_search_and_send(message, query)
 
-    @loader.command(
-        ru_doc="Добавляет текущий чат в список разрешенных",
-        en_doc="Adds current chat to allowed list",
-    )
-    async def addmcmd(self, message):
-        """Добавить чат для работы без префикса"""
-
-        chat_id = self._get_chat_id(message)
-        if chat_id == "0":
-            await self._safe_edit(message, "Не удалось определить ID чата")
-            return
-
-        current = self.allowed_chats
-        if chat_id in current:
-            await self._safe_edit(message, "Этот чат уже в списке разрешенных")
-            return
-
-        current.append(chat_id)
-        self.allowed_chats = current
-        await self._safe_edit(message, f"Чат добавлен. ID: {chat_id}")
-
-    @loader.command(
-        ru_doc="[id] - Удаляет чат из списка разрешенных",
-        en_doc="[id] - Removes chat from allowed list",
-    )
-    async def delmcmd(self, message):
-        """Удалить чат из разрешенных"""
-
-        args = utils.get_args_raw(message)
-        chat_id = args.strip() if args else self._get_chat_id(message)
-
-        if chat_id == "0":
-            await self._safe_edit(message, "Не удалось определить ID чата")
-            return
-
-        current = self.allowed_chats
-        if chat_id not in current:
-            await self._safe_edit(message, "Этот чат не найден в списке")
-            return
-
-        current.remove(chat_id)
-        self.allowed_chats = current
-        await self._safe_edit(message, f"Чат удален. ID: {chat_id}")
-
-    @loader.command(
-        ru_doc="Показывает список разрешенных чатов",
-        en_doc="Shows allowed chats list",
-    )
-    async def listmcmd(self, message):
-        """Список разрешенных чатов"""
-
-        chats = self.allowed_chats
-        if not chats:
-            await self._safe_edit(message, "Список разрешенных чатов пуст")
-            return
-
-        lines = ["Разрешенные чаты:", ""]
-        for cid in chats:
-            try:
-                entity = await self.client.get_entity(int(cid))
-                title = (
-                    getattr(entity, "title", None)
-                    or getattr(entity, "first_name", None)
-                    or "Личные сообщения"
-                )
-                lines.append(f"- {title} ({cid})")
-            except Exception:
-                lines.append(f"- Неизвестный чат ({cid})")
-
-        await self._safe_edit(message, "\n".join(lines))
-
-    # ---------- Admin: bots ----------
-
-    @loader.command(
-        ru_doc="Показывает список ботов для поиска музыки",
-        en_doc="Shows music search bots",
-    )
-    async def botsmcmd(self, message):
-        """Список ботов для поиска"""
-
-        bots = self.music_bots
-        if not bots:
-            await self._safe_edit(message, "Список ботов пуст")
-            return
-
-        lines = ["Боты для поиска музыки:", ""]
-        for i, b in enumerate(bots, 1):
-            status = " (недоступен)" if self.is_bot_failed(b) else ""
-            lines.append(f"{i}. @{b}{status}")
-
-        await self._safe_edit(message, "\n".join(lines))
-
-    @loader.command(
-        ru_doc="<юзернейм> - Добавляет бота в список",
-        en_doc="<username> - Adds bot to search list",
-    )
-    async def addbotmcmd(self, message):
-        """Добавить бота для поиска"""
-
-        args = utils.get_args_raw(message)
-        if not args:
-            await self._safe_edit(message, "Укажите username бота")
-            return
-
-        bot = args.replace("@", "").strip().lower()
-        if not bot:
-            await self._safe_edit(message, "Некорректный username")
-            return
-
-        existing = [b.lower() for b in self.music_bots]
-        if bot in existing:
-            await self._safe_edit(message, "Этот бот уже в списке")
-            return
-
-        current = self.music_bots
-        current.append(bot)
-        self.music_bots = current
-        await self._safe_edit(message, f"Бот @{bot} добавлен в список")
-
-    @loader.command(
-        ru_doc="<юзернейм> - Удаляет бота из списка",
-        en_doc="<username> - Removes bot from list",
-    )
-    async def delbotmcmd(self, message):
-        """Удалить бота из поиска"""
-
-        args = utils.get_args_raw(message)
-        if not args:
-            await self._safe_edit(message, "Укажите username бота")
-            return
-
-        bot = args.replace("@", "").strip().lower()
-        current = self.music_bots
-        new_list = [b for b in current if b.lower() != bot]
-
-        if len(new_list) == len(current):
-            await self._safe_edit(message, "Этот бот не найден в списке")
-            return
-
-        self.music_bots = new_list
-        self.failed_bots.pop(bot, None)
-        await self._safe_edit(message, f"Бот @{bot} удален из списка")
-
-    @loader.command(
-        ru_doc="Сбрасывает список ботов к исходному",
-        en_doc="Resets bot list to default",
-    )
-    async def resetbotsmcmd(self, message):
-        """Сброс списка ботов к дефолтному"""
-
-        current = [b.lower() for b in self.music_bots]
-        default = [b.lower() for b in DEFAULT_BOTS]
-
-        if current == default:
-            await self._safe_edit(message, "Список ботов уже соответствует исходному")
-            return
-
-        self.music_bots = DEFAULT_BOTS.copy()
-        self.failed_bots.clear()
-
-        lines = ["Список ботов сброшен:", ""]
-        for i, b in enumerate(DEFAULT_BOTS, 1):
-            lines.append(f"{i}. @{b}")
-        lines.append("")
-        lines.append("Все боты разблокированы")
-        await self._safe_edit(message, "\n".join(lines))
-
-    # ---------- Admin: emoji toggle ----------
+    # ==================== Admin: emoji toggle ====================
 
     @loader.command(
         ru_doc="Включает/выключает эмодзи с котом",
@@ -1091,13 +1660,10 @@ class SheoMusMod(loader.Module):
     )
     async def котмcmd(self, message):
         """Вкл/Выкл эмодзи"""
-
         self.emojis_enabled = not self.emojis_enabled
         self.database.set("SheoMus", "emojis_enabled", self.emojis_enabled)
 
         if self.emojis_enabled:
-            await self._safe_edit(
-                message, f"{self.clock_emoji()} Эмодзи включены"
-            )
+            await self._safe_edit(message, f"{self.clock_emoji()} Эмодзи включены")
         else:
             await self._safe_edit(message, "Эмодзи выключены")
