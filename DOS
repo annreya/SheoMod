@@ -2,7 +2,7 @@
 # meta banner: https://t.me/xsheo
 
 from asyncio import sleep, gather, create_task
-from telethon.errors import FloodWaitError, MessageDeleteError
+from herokutl import errors
 
 from .. import loader, utils
 
@@ -25,11 +25,11 @@ class SmertBotov(loader.Module):
                 sent = await message.reply("<b>/start</b>")
                 try:
                     await sent.delete()
-                except MessageDeleteError:
+                except errors.MessageDeleteError:
                     pass
                 sent_ok += 1
                 consecutive_errors = 0
-            except FloodWaitError as e:
+            except errors.FloodWaitError as e:
                 await sleep(e.seconds + 1)
             except Exception:
                 consecutive_errors += 1
