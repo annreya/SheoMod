@@ -1,0 +1,547 @@
+# meta developer: @sheomod
+# meta banner: https://t.me/annreya
+
+import asyncio
+import logging
+import os
+import re
+import threading
+import time
+from pathlib import Path
+
+import aiohttp
+
+from .. import loader, utils
+
+logger = logging.getLogger("aichat")
+
+
+class _ONNXEngine:
+    """ONNX Runtime GenAI: ленивая загрузка и потокобезопасная генерация."""
+
+    def __init__(self, model_dir: str, max_length: int = 2048):
+        self.model_dir = Path(model_dir)
+        self.max_length = max_length
+        self.model = None
+        self.tokenizer = None
+        self._lock = threading.Lock()
+
+    def load(self) -> bool:
+        if self.model is not None:
+            return True
+        try:
+            import onnxruntime_genai as og
+        except ImportError:
+            logger.error(
+                "onnxruntime-genai не установлен. Добавь в зависимости: onnxruntime-genai"
+            )
+            return False
+
+        if not self.model_dir.exists():
+            logger.error("Папка с моделью не найдена: %s", self.model_dir)
+            return False
+
+        cfg = self.model_dir / "genai_config.json"
+        if not cfg.exists():
+            logger.error(
+                "genai_config.json не найден в %s. "
+                "Проверь, что LOCAL_MODEL_PATH указывает на папку с конфигом GenAI.",
+                self.model_dir,
+            )
+            return False
+
+        try:
+            t0 = time.time()
+            self.model = og.Model(str(self.model_dir))
+            self.tokenizer = og.Tokenizer(self.model)
+            logger.info(
+                "ONNX-модель загружена за %.1f сек (%s)",
+                time.time() - t0, self.model_dir,
+            )
+            return True
+        except Exception as e:
+            logger.error("Ошибка загрузки ONNX-модели: %s", e)
+            self.model = None
+            self.tokenizer = None
+            return False
+
+    def generate(self, system_prompt: str, user_prompt: str,
+                 max_tokens: int = 250, temperature: float = 0.7):
+        if self.model is None or self.tokenizer is None:
+            return None
+
+        import onnxruntime_genai as og
+
+        chat_template = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+        with self._lock:
+            try:
+                input_tokens = self.tokenizer.encode(chat_template)
+                params = og.GeneratorParams(self.model)
+                params.set_search_options(
+                    max_length=min(self.max_length, max_tokens + len(input_tokens)),
+                    temperature=temperature,
+                    top_p=0.9,
+                    do_sample=True,
+                )
+                generator = og.Generator(self.model, params)
+                generator.append_tokens(input_tokens)
+
+                output_tokens = []
+                while not generator.is_done():
+                    generator.generate_next_token()
+                    new_token = generator.get_next_tokens()[0]
+                    output_tokens.append(new_token)
+
+                return self.tokenizer.decode(output_tokens).strip()
+            except Exception as e:
+                logger.error("Ошибка генерации ONNX: %s", e)
+                return None
+
+
+async def _download_onnx_model(repo_id: str, dest: str, subfolder: str = ""):
+    """Скачивает ONNX-модель с HuggingFace без huggingface_hub."""
+    os.makedirs(dest, exist_ok=True)
+    api_url = f"https://huggingface.co/api/models/{repo_id}"
+    base_url = f"https://huggingface.co/{repo_id}/resolve/main/"
+
+    skip_patterns = (".bin", ".safetensors", ".pt", ".pth", "pytorch_model")
+    keep_suffixes = (
+        ".onnx", ".onnx_data", ".onnx.data",
+        ".json", ".txt", ".model", ".tiktoken", ".vocab",
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            api_url, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            resp.raise_for_status()
+            info = await resp.json()
+
+        all_files = [s.get("rfilename", "") for s in info.get("siblings", [])]
+
+        prefix = subfolder.rstrip("/") + "/" if subfolder else ""
+        wanted = []
+        for f in all_files:
+            if prefix and not f.startswith(prefix):
+                continue
+            low = f.lower()
+            if not low.endswith(keep_suffixes):
+                continue
+            if any(p in low for p in skip_patterns):
+                continue
+            wanted.append(f)
+
+        if not wanted:
+            raise RuntimeError(
+                f"В репозитории {repo_id} не найдено файлов ONNX/токенизатора "
+                f"(подпапка: {subfolder or 'корень'})"
+            )
+
+        logger.info("Файлов к скачиванию: %d (%s)", len(wanted), repo_id)
+
+        for f in wanted:
+            url = base_url + f
+            target = os.path.join(dest, f)
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+            if os.path.exists(target) and os.path.getsize(target) > 0:
+                logger.info("Уже есть: %s", f)
+                continue
+
+            logger.info("Качаю: %s", f)
+            tmp = target + ".part"
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=1800)
+                ) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as fh:
+                        async for chunk in r.content.iter_chunked(1024 * 256):
+                            fh.write(chunk)
+                os.replace(tmp, target)
+            except Exception as e:
+                logger.error("Ошибка скачивания %s: %s", f, e)
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                raise
+
+    return dest
+
+
+@loader.tds
+class AIChatMod(loader.Module):
+    """Общение через локальную ONNX-ИИ в группах, ЛС и каналах"""
+
+    strings = {"name": "AIChat"}
+
+    _MODELS = {
+        "qwen0.5b": ("elbruno/Qwen2.5-0.5B-LocalLLMs-ToolCalling", ""),
+        "qwen0.5b-int4": (
+            "xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai",
+            "cuda/cuda-int4-rtn-block-32",
+        ),
+        "qwen0.5b-fp16": (
+            "xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai",
+            "cuda/cuda-fp16",
+        ),
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "TRIGGER_WORD",
+                "шео",
+                "Слово-обращение для запуска ИИ (регистр не важен).",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "REPLY_TO_SELF",
+                True,
+                "Отвечать на сообщения со своего аккаунта (при наличии триггера).",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "OWNER_BYPASS",
+                True,
+                "Владельцу отвечать в любом чате без .aichat on.",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "LOCAL_MODEL",
+                "qwen0.5b",
+                "Ключ модели: qwen0.5b, qwen0.5b-int4, qwen0.5b-fp16.",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "LOCAL_MODEL_PATH",
+                "",
+                "Полный путь к папке с genai_config.json. "
+                "Если пусто — берётся из LOCAL_MODEL.",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "SYSTEM_PROMPT",
+                "Ты — полезный ассистент, который отвечает от имени пользователя. "
+                "Отвечай кратко, естественно, в дружелюбном тоне и на том же языке, "
+                "что и собеседник.",
+                "Системная инструкция для ИИ.",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "MAX_TOKENS",
+                250,
+                "Максимум токенов в ответе.",
+                validator=loader.validators.Integer(minimum=32, maximum=2000),
+            ),
+            loader.ConfigValue(
+                "COOLDOWN",
+                5,
+                "Минимальная пауза между ответами в одном чате (сек).",
+                validator=loader.validators.Integer(minimum=0, maximum=600),
+            ),
+        )
+        self.active_chats = set()
+        self.last_reply = {}
+        self.bot_message_ids = {}
+        self.session = None
+        self.engine = None
+        self._engine_ready = False
+
+    async def client_ready(self, client, db):
+        self._db = db
+        self.session = aiohttp.ClientSession()
+        self._load_active_chats()
+        asyncio.create_task(self._init_local_engine())
+        logger.info(
+            "AIChat: инициализирован. Триггер: '%s', активных чатов: %d",
+            self.config["TRIGGER_WORD"], len(self.active_chats),
+        )
+
+    async def on_unload(self):
+        self._save_active_chats()
+        if self.session:
+            await self.session.close()
+        if self.engine:
+            self.engine.model = None
+            self.engine.tokenizer = None
+
+    # ==================== Persistence ====================
+
+    def _load_active_chats(self):
+        try:
+            saved = self.get("active_chats", [])
+            if isinstance(saved, list):
+                self.active_chats = set(int(c) for c in saved)
+            logger.info(
+                "AIChat: загружено активных чатов: %d", len(self.active_chats)
+            )
+        except Exception as e:
+            logger.error("AIChat: не удалось загрузить active_chats: %s", e)
+            self.active_chats = set()
+
+    def _save_active_chats(self):
+        try:
+            self.set("active_chats", list(self.active_chats))
+            logger.info(
+                "AIChat: сохранено активных чатов: %d", len(self.active_chats)
+            )
+        except Exception as e:
+            logger.error("AIChat: не удалось сохранить active_chats: %s", e)
+
+    # ==================== Engine ====================
+
+    async def _init_local_engine(self):
+        model_key = self.config["LOCAL_MODEL"]
+        custom_path = self.config["LOCAL_MODEL_PATH"].strip()
+
+        if custom_path:
+            path = custom_path
+        else:
+            entry = self._MODELS.get(model_key)
+            if not entry:
+                logger.error("Неизвестный ключ модели: %s", model_key)
+                return
+            repo_id, subfolder = entry
+            base = os.path.join("/tmp", "aichat_onnx", model_key)
+            path = os.path.join(base, subfolder) if subfolder else base
+            cfg_path = os.path.join(path, "genai_config.json")
+
+            if not os.path.exists(cfg_path):
+                logger.info(
+                    "Скачиваю ONNX-модель: %s (подпапка: %s)",
+                    repo_id, subfolder or "корень",
+                )
+                try:
+                    await _download_onnx_model(repo_id, base, subfolder)
+                    logger.info("ONNX-модель сохранена: %s", base)
+                except Exception as e:
+                    logger.error("Не удалось скачать ONNX-модель: %s", e)
+                    return
+
+            if not os.path.exists(cfg_path):
+                logger.error(
+                    "После скачивания genai_config.json всё ещё отсутствует: %s",
+                    cfg_path,
+                )
+                return
+
+        self.engine = _ONNXEngine(path, max_length=2048)
+        ok = await asyncio.to_thread(self.engine.load)
+        self._engine_ready = ok
+
+    # ==================== Helpers ====================
+
+    def _is_triggered(self, text, chat_id, reply_msg):
+        trigger = self.config["TRIGGER_WORD"].lower()
+        if trigger and trigger in text.lower():
+            return True
+        if reply_msg and reply_msg.id in self.bot_message_ids.get(chat_id, set()):
+            return True
+        return False
+
+    def _clean_text(self, text):
+        trigger = self.config["TRIGGER_WORD"]
+        if not trigger:
+            return text.strip()
+        return re.sub(
+            re.escape(trigger), "", text, flags=re.IGNORECASE
+        ).strip(" ,.!?-—")
+
+    async def _ask_ai(self, text):
+        if not self.engine or not self._engine_ready:
+            logger.warning("AIChat: локальная модель не загружена, ответ невозможен")
+            return None
+        return await asyncio.to_thread(
+            self.engine.generate,
+            self.config["SYSTEM_PROMPT"],
+            text,
+            self.config["MAX_TOKENS"],
+        )
+
+    # ==================== Commands ====================
+
+    @loader.command(
+        ru_doc="[on/off/list] - Управление ИИ в этом чате",
+        en_doc="[on/off/list] - Manage AI in this chat",
+    )
+    async def aichat(self, message):
+        """Включить/выключить ИИ в этом чате"""
+        raw = utils.get_args_raw(message).strip().lower()
+        chat_id = message.chat_id
+
+        if raw == "on":
+            self.active_chats.add(chat_id)
+            self._save_active_chats()
+            await utils.answer(message, "ИИ-ответы включены в этом чате.")
+        elif raw == "off":
+            self.active_chats.discard(chat_id)
+            self._save_active_chats()
+            await utils.answer(message, "ИИ-ответы выключены в этом чате.")
+        elif raw == "list":
+            if not self.active_chats:
+                await utils.answer(message, "Нет активных чатов.")
+                return
+            lines = [f"Активных чатов: {len(self.active_chats)}"]
+            for cid in sorted(self.active_chats):
+                lines.append(f"• <code>{cid}</code>")
+            await utils.answer(message, "\n".join(lines))
+        else:
+            await utils.answer(
+                message,
+                "Использование: .aichat on | off | list",
+            )
+
+    @loader.command(
+        ru_doc="- Показать статус модуля в этом чате",
+        en_doc="- Show module status in this chat",
+    )
+    async def aistatus(self, message):
+        """Статус модуля в этом чате"""
+        chat_id = message.chat_id
+        state = "включены" if chat_id in self.active_chats else "выключены"
+        if self._engine_ready:
+            mode = f"локальная ONNX ({self.config['LOCAL_MODEL']})"
+        else:
+            mode = "локальная модель не загружена"
+        await utils.answer(
+            message,
+            f"ИИ-ответы {state} в этом чате.\n"
+            f"Режим: {mode}\n"
+            f"Триггер: {self.config['TRIGGER_WORD']}\n"
+            f"Всего активных чатов: {len(self.active_chats)}\n"
+            f"Ответы своему аккаунту: "
+            f"{'вкл' if self.config['REPLY_TO_SELF'] else 'выкл'}\n"
+            f"Обход владельца: "
+            f"{'вкл' if self.config['OWNER_BYPASS'] else 'выкл'}",
+        )
+
+    @loader.command(
+        ru_doc="<слово> - Установить слово-обращение для ИИ",
+        en_doc="<word> - Set trigger word for AI",
+    )
+    async def aitrigger(self, message):
+        """Установить слово-обращение для ИИ"""
+        arg = utils.get_args_raw(message).strip()
+        if not arg:
+            await utils.answer(
+                message,
+                f"Текущий триггер: {self.config['TRIGGER_WORD']}\n"
+                f"Использование: .aitrigger <слово>",
+            )
+            return
+        self.config["TRIGGER_WORD"] = arg
+        await utils.answer(message, f"Триггер изменён на: {arg}")
+
+    @loader.command(
+        ru_doc="[on/off] - Отвечать ли на сообщения со своего аккаунта",
+        en_doc="[on/off] - Reply to messages from own account",
+    )
+    async def aiself(self, message):
+        """Ответы своему аккаунту"""
+        arg = utils.get_args_raw(message).strip().lower()
+        if arg == "on":
+            self.config["REPLY_TO_SELF"] = True
+            await utils.answer(message, "Ответы своему аккаунту включены.")
+        elif arg == "off":
+            self.config["REPLY_TO_SELF"] = False
+            await utils.answer(message, "Ответы своему аккаунту выключены.")
+        else:
+            await utils.answer(
+                message,
+                f"Ответы своему аккаунту: "
+                f"{'вкл' if self.config['REPLY_TO_SELF'] else 'выкл'}\n"
+                f"Использование: .aiself on|off",
+            )
+
+    @loader.command(
+        ru_doc="[on/off] - Обход правила .aichat on для владельца",
+        en_doc="[on/off] - Owner bypass for .aichat on rule",
+    )
+    async def aiowner(self, message):
+        """Обход владельца"""
+        arg = utils.get_args_raw(message).strip().lower()
+        if arg == "on":
+            self.config["OWNER_BYPASS"] = True
+            await utils.answer(message, "Обход владельца включён.")
+        elif arg == "off":
+            self.config["OWNER_BYPASS"] = False
+            await utils.answer(message, "Обход владельца выключен.")
+        else:
+            await utils.answer(
+                message,
+                f"Обход владельца: "
+                f"{'вкл' if self.config['OWNER_BYPASS'] else 'выкл'}\n"
+                f"Использование: .aiowner on|off",
+            )
+
+    @loader.command(
+        ru_doc="- Перезагрузить ONNX-модель",
+        en_doc="- Reload the ONNX model",
+    )
+    async def aireload(self, message):
+        """Перезагрузить ONNX-модель"""
+        self._engine_ready = False
+        self.engine = None
+        await utils.answer(message, "Перезагружаю ONNX-модель...")
+        asyncio.create_task(self._init_local_engine())
+
+    # ==================== Watcher ====================
+
+    @loader.watcher(only_messages=True, no_commands=True)
+    async def watcher(self, message):
+        if not self.session:
+            return
+
+        text = message.raw_text
+        if not text:
+            return
+
+        chat_msgs = self.bot_message_ids.get(message.chat_id, set())
+
+        if message.out:
+            if not self.config["REPLY_TO_SELF"]:
+                return
+            if message.id in chat_msgs:
+                return
+            trigger = self.config["TRIGGER_WORD"].lower()
+            if not trigger or trigger not in text.lower():
+                return
+            if not self.config["OWNER_BYPASS"]:
+                if message.chat_id not in self.active_chats:
+                    return
+        else:
+            if message.chat_id not in self.active_chats:
+                return
+            reply_msg = (
+                await message.get_reply_message() if message.is_reply else None
+            )
+            if not self._is_triggered(text, message.chat_id, reply_msg):
+                return
+
+        now = message.date.timestamp()
+        if now - self.last_reply.get(message.chat_id, 0) < self.config["COOLDOWN"]:
+            return
+        self.last_reply[message.chat_id] = now
+
+        clean = self._clean_text(text)
+        if not clean:
+            return
+
+        try:
+            reply_text = await self._ask_ai(clean)
+            if reply_text:
+                sent = await message.reply(reply_text)
+                chat_msgs.add(sent.id)
+                self.bot_message_ids[message.chat_id] = chat_msgs
+        except Exception as e:
+            logger.error("AIChat: ошибка генерации ответа: %s", e)
