@@ -1,26 +1,32 @@
 # meta developer: @sheomod
-# meta banner: https://t.me/annreya
+# meta banner: https://t.me/xsheo
 
 import asyncio
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
 
 import aiohttp
+from huggingface_hub import snapshot_download
 
 from .. import loader, utils
+from ..inline.types import InlineCall
 
 logger = logging.getLogger("aichat")
+
+MODELS_ROOT = "/tmp/aichat_onnx"
 
 
 class _ONNXEngine:
     """ONNX Runtime GenAI: ленивая загрузка и потокобезопасная генерация."""
 
-    def __init__(self, model_dir: str, max_length: int = 2048):
+    def __init__(self, model_dir: str, chat_template: str, max_length: int = 4096):
         self.model_dir = Path(model_dir)
+        self.chat_template = chat_template
         self.max_length = max_length
         self.model = None
         self.tokenizer = None
@@ -72,15 +78,13 @@ class _ONNXEngine:
 
         import onnxruntime_genai as og
 
-        chat_template = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
+        chat = self.chat_template.format(
+            system=system_prompt, user=user_prompt
         )
 
         with self._lock:
             try:
-                input_tokens = self.tokenizer.encode(chat_template)
+                input_tokens = self.tokenizer.encode(chat)
                 params = og.GeneratorParams(self.model)
                 params.set_search_options(
                     max_length=min(self.max_length, max_tokens + len(input_tokens)),
@@ -103,78 +107,58 @@ class _ONNXEngine:
                 return None
 
 
+def _wipe_path(path: str):
+    """Полностью удаляет файл или папку."""
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logger.warning("Не удалось удалить %s: %s", path, e)
+
+
+def _wipe_models_root():
+    """Удаляет всю папку с моделями."""
+    _wipe_path(MODELS_ROOT)
+    logger.info("AIChat: очищена папка %s", MODELS_ROOT)
+
+
+def _wipe_partial_files(root: str):
+    """Удаляет все .part файлы и временные артефакты HF."""
+    try:
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if f.endswith(".part") or f.endswith(".incomplete"):
+                    _wipe_path(os.path.join(dirpath, f))
+    except Exception as e:
+        logger.warning("Ошибка очистки .part в %s: %s", root, e)
+
+
 async def _download_onnx_model(repo_id: str, dest: str, subfolder: str = ""):
-    """Скачивает ONNX-модель с HuggingFace без huggingface_hub."""
+    """Скачивает все файлы модели через huggingface_hub."""
     os.makedirs(dest, exist_ok=True)
-    api_url = f"https://huggingface.co/api/models/{repo_id}"
-    base_url = f"https://huggingface.co/{repo_id}/resolve/main/"
 
-    skip_patterns = (".bin", ".safetensors", ".pt", ".pth", "pytorch_model")
-    keep_suffixes = (
-        ".onnx", ".onnx_data", ".onnx.data",
-        ".json", ".txt", ".model", ".tiktoken", ".vocab",
+    if subfolder:
+        allow_patterns = [f"{subfolder.rstrip('/')}/*"]
+    else:
+        allow_patterns = ["*"]
+
+    ignore_patterns = [
+        "*.bin", "*.safetensors", "*.pt", "*.pth",
+        "pytorch_model*", "*.h5", "*.msgpack",
+    ]
+
+    logger.info("Скачиваю модель %s (подпапка: %s)", repo_id, subfolder or "корень")
+    await asyncio.to_thread(
+        snapshot_download,
+        repo_id=repo_id,
+        local_dir=dest,
+        allow_patterns=allow_patterns,
+        ignore_patterns=ignore_patterns,
+        local_dir_use_symlinks=False,
     )
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            api_url, timeout=aiohttp.ClientTimeout(total=30)
-        ) as resp:
-            resp.raise_for_status()
-            info = await resp.json()
-
-        all_files = [s.get("rfilename", "") for s in info.get("siblings", [])]
-
-        prefix = subfolder.rstrip("/") + "/" if subfolder else ""
-        wanted = []
-        for f in all_files:
-            if prefix and not f.startswith(prefix):
-                continue
-            low = f.lower()
-            if not low.endswith(keep_suffixes):
-                continue
-            if any(p in low for p in skip_patterns):
-                continue
-            wanted.append(f)
-
-        if not wanted:
-            raise RuntimeError(
-                f"В репозитории {repo_id} не найдено файлов ONNX/токенизатора "
-                f"(подпапка: {subfolder or 'корень'})"
-            )
-
-        logger.info("Файлов к скачиванию: %d (%s)", len(wanted), repo_id)
-
-        for f in wanted:
-            url = base_url + f
-            target = os.path.join(dest, f)
-            parent = os.path.dirname(target)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-
-            if os.path.exists(target) and os.path.getsize(target) > 0:
-                logger.info("Уже есть: %s", f)
-                continue
-
-            logger.info("Качаю: %s", f)
-            tmp = target + ".part"
-            try:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=1800)
-                ) as r:
-                    r.raise_for_status()
-                    with open(tmp, "wb") as fh:
-                        async for chunk in r.content.iter_chunked(1024 * 256):
-                            fh.write(chunk)
-                os.replace(tmp, target)
-            except Exception as e:
-                logger.error("Ошибка скачивания %s: %s", f, e)
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-                raise
-
+    logger.info("Модель сохранена: %s", dest)
     return dest
 
 
@@ -184,15 +168,47 @@ class AIChatMod(loader.Module):
 
     strings = {"name": "AIChat"}
 
+    _PHI_TEMPLATE = (
+        "<|system|>\n{system}<|end|>\n"
+        "<|user|>\n{user}<|end|>\n"
+        "<|assistant|>\n"
+    )
+    _QWEN_TEMPLATE = (
+        "<|im_start|>system\n{system}<|im_end|>\n"
+        "<|im_start|>user\n{user}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
     _MODELS = {
-        "qwen0.5b": ("elbruno/Qwen2.5-0.5B-LocalLLMs-ToolCalling", ""),
-        "qwen0.5b-int4": (
-            "xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai",
-            "cuda/cuda-int4-rtn-block-32",
+        "phi3.5-mini": (
+            "microsoft/Phi-3.5-mini-instruct-onnx",
+            "cpu_and_mobile/cpu-int4-awq-block-128-acc-level-4",
+            _PHI_TEMPLATE,
+            "Phi-3.5-mini (3.8B, INT4, ~2.8 GB) — рекомендуется",
         ),
-        "qwen0.5b-fp16": (
-            "xiaoyao9184/Qwen2.5-0.5B-Instruct-onnx-genai",
-            "cuda/cuda-fp16",
+        "phi3-mini": (
+            "microsoft/Phi-3-mini-4k-instruct-onnx",
+            "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4",
+            _PHI_TEMPLATE,
+            "Phi-3-mini (3.8B, INT4, ~2.3 GB) — старая версия",
+        ),
+        "phi3.5-mini-cuda": (
+            "microsoft/Phi-3.5-mini-instruct-onnx",
+            "cuda/cuda-int4-awq-block-128",
+            _PHI_TEMPLATE,
+            "Phi-3.5-mini CUDA (нужен GPU, ~2.8 GB)",
+        ),
+        "qwen1.5b-int4": (
+            "Arm/qwen2-5-1-5b-instruct-onnx-genai-int4-kquantlast-emb-int4",
+            "",
+            _QWEN_TEMPLATE,
+            "Qwen2.5-1.5B INT4 (~1 GB) — лёгкая",
+        ),
+        "qwen0.5b": (
+            "elbruno/Qwen2.5-0.5B-LocalLLMs-ToolCalling",
+            "",
+            _QWEN_TEMPLATE,
+            "Qwen2.5-0.5B INT4 (~500 MB) — очень лёгкая",
         ),
     }
 
@@ -218,8 +234,8 @@ class AIChatMod(loader.Module):
             ),
             loader.ConfigValue(
                 "LOCAL_MODEL",
-                "qwen0.5b",
-                "Ключ модели: qwen0.5b, qwen0.5b-int4, qwen0.5b-fp16.",
+                "phi3.5-mini",
+                "Ключ модели. Меняется через .aimodel.",
                 validator=loader.validators.String(),
             ),
             loader.ConfigValue(
@@ -249,95 +265,121 @@ class AIChatMod(loader.Module):
                 "Минимальная пауза между ответами в одном чате (сек).",
                 validator=loader.validators.Integer(minimum=0, maximum=600),
             ),
+            loader.ConfigValue(
+                "ACTIVE_CHATS",
+                "",
+                "ID чатов, где включён ИИ, через запятую. "
+                "Управляется командами .aichat on/off.",
+                validator=loader.validators.String(),
+            ),
         )
-        self.active_chats = set()
         self.last_reply = {}
         self.bot_message_ids = {}
         self.session = None
         self.engine = None
         self._engine_ready = False
+        self._download_lock = asyncio.Lock()
 
     async def client_ready(self, client, db):
         self._db = db
         self.session = aiohttp.ClientSession()
-        self._load_active_chats()
+        await asyncio.to_thread(_wipe_partial_files, MODELS_ROOT)
         asyncio.create_task(self._init_local_engine())
         logger.info(
             "AIChat: инициализирован. Триггер: '%s', активных чатов: %d",
-            self.config["TRIGGER_WORD"], len(self.active_chats),
+            self.config["TRIGGER_WORD"], len(self._get_active_chats()),
         )
 
     async def on_unload(self):
-        self._save_active_chats()
         if self.session:
             await self.session.close()
         if self.engine:
             self.engine.model = None
             self.engine.tokenizer = None
 
-    # ==================== Persistence ====================
+    # ==================== Active chats (из config) ====================
 
-    def _load_active_chats(self):
-        try:
-            saved = self.get("active_chats", [])
-            if isinstance(saved, list):
-                self.active_chats = set(int(c) for c in saved)
-            logger.info(
-                "AIChat: загружено активных чатов: %d", len(self.active_chats)
-            )
-        except Exception as e:
-            logger.error("AIChat: не удалось загрузить active_chats: %s", e)
-            self.active_chats = set()
+    def _get_active_chats(self):
+        raw = self.config["ACTIVE_CHATS"] or ""
+        result = set()
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                result.add(int(chunk))
+            except ValueError:
+                continue
+        return result
 
-    def _save_active_chats(self):
-        try:
-            self.set("active_chats", list(self.active_chats))
-            logger.info(
-                "AIChat: сохранено активных чатов: %d", len(self.active_chats)
-            )
-        except Exception as e:
-            logger.error("AIChat: не удалось сохранить active_chats: %s", e)
+    def _set_active_chats(self, chats):
+        self.config["ACTIVE_CHATS"] = ",".join(str(c) for c in sorted(chats))
+
+    def _add_active_chat(self, chat_id):
+        chats = self._get_active_chats()
+        chats.add(int(chat_id))
+        self._set_active_chats(chats)
+
+    def _remove_active_chat(self, chat_id):
+        chats = self._get_active_chats()
+        chats.discard(int(chat_id))
+        self._set_active_chats(chats)
 
     # ==================== Engine ====================
 
     async def _init_local_engine(self):
-        model_key = self.config["LOCAL_MODEL"]
-        custom_path = self.config["LOCAL_MODEL_PATH"].strip()
+        async with self._download_lock:
+            model_key = self.config["LOCAL_MODEL"]
+            custom_path = self.config["LOCAL_MODEL_PATH"].strip()
 
-        if custom_path:
-            path = custom_path
-        else:
-            entry = self._MODELS.get(model_key)
-            if not entry:
-                logger.error("Неизвестный ключ модели: %s", model_key)
-                return
-            repo_id, subfolder = entry
-            base = os.path.join("/tmp", "aichat_onnx", model_key)
-            path = os.path.join(base, subfolder) if subfolder else base
-            cfg_path = os.path.join(path, "genai_config.json")
+            if custom_path:
+                path = custom_path
+                template = self._QWEN_TEMPLATE
+            else:
+                entry = self._MODELS.get(model_key)
+                if not entry:
+                    logger.error(
+                        "Неизвестный ключ модели: %s. Доступные: %s",
+                        model_key, ", ".join(self._MODELS.keys()),
+                    )
+                    return
+                repo_id, subfolder, template, _desc = entry
+                base = os.path.join(MODELS_ROOT, model_key)
+                path = os.path.join(base, subfolder) if subfolder else base
+                cfg_path = os.path.join(path, "genai_config.json")
 
-            if not os.path.exists(cfg_path):
-                logger.info(
-                    "Скачиваю ONNX-модель: %s (подпапка: %s)",
-                    repo_id, subfolder or "корень",
-                )
-                try:
-                    await _download_onnx_model(repo_id, base, subfolder)
-                    logger.info("ONNX-модель сохранена: %s", base)
-                except Exception as e:
-                    logger.error("Не удалось скачать ONNX-модель: %s", e)
+                if not os.path.exists(cfg_path):
+                    # Если папка есть, но конфига нет — значит, скачивание
+                    # было прервано или неполное. Сносим и качаем заново.
+                    if os.path.exists(base):
+                        logger.warning(
+                            "Обнаружены неполные данные модели, "
+                            "удаляю %s и скачиваю заново", base,
+                        )
+                        await asyncio.to_thread(_wipe_path, base)
+
+                    logger.info(
+                        "Скачиваю ONNX-модель: %s (подпапка: %s)",
+                        repo_id, subfolder or "корень",
+                    )
+                    try:
+                        await _download_onnx_model(repo_id, base, subfolder)
+                        logger.info("ONNX-модель сохранена: %s", base)
+                    except Exception as e:
+                        logger.error("Не удалось скачать ONNX-модель: %s", e)
+                        return
+
+                if not os.path.exists(cfg_path):
+                    logger.error(
+                        "После скачивания genai_config.json всё ещё отсутствует: %s. "
+                        "Проверь правильность ключа модели или LOCAL_MODEL_PATH.",
+                        cfg_path,
+                    )
                     return
 
-            if not os.path.exists(cfg_path):
-                logger.error(
-                    "После скачивания genai_config.json всё ещё отсутствует: %s",
-                    cfg_path,
-                )
-                return
-
-        self.engine = _ONNXEngine(path, max_length=2048)
-        ok = await asyncio.to_thread(self.engine.load)
-        self._engine_ready = ok
+            self.engine = _ONNXEngine(path, template, max_length=4096)
+            ok = await asyncio.to_thread(self.engine.load)
+            self._engine_ready = ok
 
     # ==================== Helpers ====================
 
@@ -368,6 +410,85 @@ class AIChatMod(loader.Module):
             self.config["MAX_TOKENS"],
         )
 
+    def _build_model_markup(self):
+        rows = []
+        current = self.config["LOCAL_MODEL"]
+        for key, entry in self._MODELS.items():
+            desc = entry[3] if len(entry) > 3 else key
+            mark = "✅ " if key == current else ""
+            rows.append(
+                [
+                    {
+                        "text": f"{mark}{desc}",
+                        "callback": self._on_model_pick,
+                        "args": (key,),
+                    }
+                ]
+            )
+        rows.append(
+            [
+                {
+                    "text": "🗑 Очистить временные файлы",
+                    "callback": self._on_wipe_cache,
+                    "args": (),
+                }
+            ]
+        )
+        rows.append(
+            [
+                {
+                    "text": "Закрыть",
+                    "action": "close",
+                }
+            ]
+        )
+        return rows
+
+    def _model_text(self):
+        current = self.config["LOCAL_MODEL"]
+        if self._engine_ready:
+            state = "загружена"
+        else:
+            state = "не загружена"
+        desc = self._MODELS.get(current, ("", "", "", current))[3] \
+            if current in self._MODELS else current
+        return (
+            "Выбор локальной модели\n\n"
+            f"Текущая: <b>{current}</b>\n"
+            f"Описание: {desc}\n"
+            f"Состояние: {state}\n\n"
+            "После выбора модель начнёт скачиваться и загружаться. "
+            "Это может занять несколько минут."
+        )
+
+    async def _on_model_pick(self, call: InlineCall, key: str):
+        if key not in self._MODELS:
+            await call.answer("Неизвестная модель", show_alert=True)
+            return
+        self.config["LOCAL_MODEL"] = key
+        await call.answer(f"Выбрана модель: {key}", show_alert=False)
+        try:
+            await call.edit(self._model_text(), reply_markup=self._build_model_markup())
+        except Exception:
+            pass
+        self._engine_ready = False
+        self.engine = None
+        asyncio.create_task(self._init_local_engine())
+
+    async def _on_wipe_cache(self, call: InlineCall):
+        await call.answer("Удаляю временные файлы...", show_alert=False)
+        self._engine_ready = False
+        self.engine = None
+        await asyncio.to_thread(_wipe_models_root)
+        try:
+            await call.edit(
+                "Временные файлы моделей удалены.\n"
+                "Используй .aireload для повторного скачивания.",
+                reply_markup=[[{"text": "Закрыть", "action": "close"}]],
+            )
+        except Exception:
+            pass
+
     # ==================== Commands ====================
 
     @loader.command(
@@ -380,19 +501,18 @@ class AIChatMod(loader.Module):
         chat_id = message.chat_id
 
         if raw == "on":
-            self.active_chats.add(chat_id)
-            self._save_active_chats()
+            self._add_active_chat(chat_id)
             await utils.answer(message, "ИИ-ответы включены в этом чате.")
         elif raw == "off":
-            self.active_chats.discard(chat_id)
-            self._save_active_chats()
+            self._remove_active_chat(chat_id)
             await utils.answer(message, "ИИ-ответы выключены в этом чате.")
         elif raw == "list":
-            if not self.active_chats:
+            chats = self._get_active_chats()
+            if not chats:
                 await utils.answer(message, "Нет активных чатов.")
                 return
-            lines = [f"Активных чатов: {len(self.active_chats)}"]
-            for cid in sorted(self.active_chats):
+            lines = [f"Активных чатов: {len(chats)}"]
+            for cid in sorted(chats):
                 lines.append(f"• <code>{cid}</code>")
             await utils.answer(message, "\n".join(lines))
         else:
@@ -408,21 +528,64 @@ class AIChatMod(loader.Module):
     async def aistatus(self, message):
         """Статус модуля в этом чате"""
         chat_id = message.chat_id
-        state = "включены" if chat_id in self.active_chats else "выключены"
+        chats = self._get_active_chats()
+        state = "включены" if chat_id in chats else "выключены"
         if self._engine_ready:
             mode = f"локальная ONNX ({self.config['LOCAL_MODEL']})"
         else:
             mode = "локальная модель не загружена"
+        size = await asyncio.to_thread(self._models_size_mb)
         await utils.answer(
             message,
             f"ИИ-ответы {state} в этом чате.\n"
             f"Режим: {mode}\n"
             f"Триггер: {self.config['TRIGGER_WORD']}\n"
-            f"Всего активных чатов: {len(self.active_chats)}\n"
+            f"Всего активных чатов: {len(chats)}\n"
             f"Ответы своему аккаунту: "
             f"{'вкл' if self.config['REPLY_TO_SELF'] else 'выкл'}\n"
             f"Обход владельца: "
-            f"{'вкл' if self.config['OWNER_BYPASS'] else 'выкл'}",
+            f"{'вкл' if self.config['OWNER_BYPASS'] else 'выкл'}\n"
+            f"Занято в /tmp: {size:.1f} MB",
+        )
+
+    def _models_size_mb(self):
+        total = 0
+        try:
+            for dirpath, _dirs, files in os.walk(MODELS_ROOT):
+                for f in files:
+                    fp = os.path.join(dirpath, f)
+                    if os.path.exists(fp):
+                        total += os.path.getsize(fp)
+        except Exception:
+            pass
+        return total / (1024 * 1024)
+
+    @loader.command(
+        ru_doc="- Выбрать локальную модель (инлайн-меню)",
+        en_doc="- Pick the local model (inline menu)",
+    )
+    async def aimodel(self, message):
+        """Выбрать локальную модель"""
+        await self.inline.form(
+            text=self._model_text(),
+            message=message,
+            reply_markup=self._build_model_markup(),
+        )
+
+    @loader.command(
+        ru_doc="- Удалить все временные файлы моделей",
+        en_doc="- Remove all temporary model files",
+    )
+    async def aiclear(self, message):
+        """Удалить все временные файлы моделей"""
+        self._engine_ready = False
+        self.engine = None
+        size_before = await asyncio.to_thread(self._models_size_mb)
+        await asyncio.to_thread(_wipe_models_root)
+        await utils.answer(
+            message,
+            f"Удалено {size_before:.1f} MB временных файлов моделей.\n"
+            f"Используй .aireload для повторного скачивания.",
         )
 
     @loader.command(
@@ -506,6 +669,7 @@ class AIChatMod(loader.Module):
         if not text:
             return
 
+        chats = self._get_active_chats()
         chat_msgs = self.bot_message_ids.get(message.chat_id, set())
 
         if message.out:
@@ -517,10 +681,10 @@ class AIChatMod(loader.Module):
             if not trigger or trigger not in text.lower():
                 return
             if not self.config["OWNER_BYPASS"]:
-                if message.chat_id not in self.active_chats:
+                if message.chat_id not in chats:
                     return
         else:
-            if message.chat_id not in self.active_chats:
+            if message.chat_id not in chats:
                 return
             reply_msg = (
                 await message.get_reply_message() if message.is_reply else None
