@@ -2,24 +2,36 @@
 # meta banner: https://t.me/xsheo
 
 from .. import loader, utils
+import asyncio
 import time
 import logging
-from telethon.tl.types import Message
+from telethon.tl.types import (
+    MessageEntityPre, MessageEntityCode, MessageEntityBold,
+    MessageEntityItalic, MessageEntityUnderline, MessageEntityStrike,
+    MessageEntitySpoiler,
+)
+from telethon.tl.functions.messages import EditMessageRequest
+
+try:
+    from telethon.tl.types import MessageEntityBlockquote
+except ImportError:
+    MessageEntityBlockquote = None
 
 logger = logging.getLogger("sheopre")
 
 
 # ==================== Конфиг ====================
 
-SKIP_IF_ALREADY_WRAPPED = True
 SKIP_COMMANDS = True
 EDIT_CAPTIONS = True
 MAX_LEN = 4000
 DEDUP_TTL = 10
 DEDUP_MAX = 200
 DEBUG = False
+FIRE_AND_FORGET = True
 
-# Режимы: key -> (название, open, close)
+# ==================== Данные ====================
+
 MODES = {
     "pre":        ("pre",          "<pre>",         "</pre>"),
     "code":       ("code",         "<code>",        "</code>"),
@@ -41,23 +53,35 @@ COMMON_LANGS_HINT = (
     "bash, shell, dockerfile, lua, r, dart, perl, scala, ..."
 )
 
-_WRAP_PAIRS = tuple(
-    (o, c) for _k, (_n, o, c) in MODES.items() if o and c
-)
-_ESC_TABLE = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
 _COMMAND_CHARS = frozenset("./!")
 _MODE_KEYS = frozenset(MODES.keys())
 
+ENTITY_FACTORIES = {
+    "pre":        lambda n, l: MessageEntityPre(offset=0, length=n, language=""),
+    "precode":    lambda n, l: MessageEntityPre(offset=0, length=n, language=l or ""),
+    "code":       lambda n, l: MessageEntityCode(offset=0, length=n),
+    "bold":       lambda n, l: MessageEntityBold(offset=0, length=n),
+    "italic":     lambda n, l: MessageEntityItalic(offset=0, length=n),
+    "underline":  lambda n, l: MessageEntityUnderline(offset=0, length=n),
+    "strike":     lambda n, l: MessageEntityStrike(offset=0, length=n),
+    "spoiler":    lambda n, l: MessageEntitySpoiler(offset=0, length=n),
+}
+if MessageEntityBlockquote is not None:
+    ENTITY_FACTORIES["blockquote"] = lambda n, l: MessageEntityBlockquote(offset=0, length=n)
+
+# HTML-экранирование для формы
+_ESC_TABLE = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
+
 
 class SheoPreMod(loader.Module):
-    """Оборачивает ваши сообщения в HTML-тег"""
+    """Оборачивает ваши сообщения в форматирование"""
 
     strings = {"name": "SheoPre"}
 
     __slots__ = (
         "database", "client", "enabled", "mode", "language",
-        "_wrap_open", "_wrap_close", "_mode_label_cache",
-        "_processed", "_shutdown",
+        "_entity_factory", "_mode_label_cache",
+        "_processed", "_shutdown", "_pending",
     )
 
     def __init__(self):
@@ -66,11 +90,11 @@ class SheoPreMod(loader.Module):
         self.enabled = True
         self.mode = DEFAULT_MODE
         self.language = DEFAULT_LANG
-        self._wrap_open = MODES[DEFAULT_MODE][1]
-        self._wrap_close = MODES[DEFAULT_MODE][2]
+        self._entity_factory = ENTITY_FACTORIES[DEFAULT_MODE]
         self._mode_label_cache = MODES[DEFAULT_MODE][0]
         self._processed = {}
         self._shutdown = False
+        self._pending = set()
         super().__init__()
 
     async def client_ready(self, client, database):
@@ -84,26 +108,19 @@ class SheoPreMod(loader.Module):
 
     async def on_unload(self):
         self._shutdown = True
+        for t in list(self._pending):
+            t.cancel()
 
     # ==================== Внутренние ====================
 
     def _apply_mode(self, key):
         self.mode = key
-        name, o, c = MODES[key]
-        if key == "precode":
-            lang = (self.language or "").strip()
-            if lang:
-                o = f'<pre><code class="language-{lang}">'
-            else:
-                o = '<pre><code>'
-        self._wrap_open = o
-        self._wrap_close = c
+        name, _o, _c = MODES[key]
         self._mode_label_cache = name
+        self._entity_factory = ENTITY_FACTORIES.get(key)
 
     def _apply_language(self, code):
         self.language = (code or "").strip()
-        if self.mode == "precode":
-            self._apply_mode("precode")
 
     def _is_recent(self, msg_id):
         d = self._processed
@@ -116,20 +133,55 @@ class SheoPreMod(loader.Module):
                 d.pop(k, None)
         return False
 
-    @staticmethod
-    def _already_wrapped(text):
-        t = text.strip()
-        for o, c in _WRAP_PAIRS:
-            if t.startswith(o) and t.endswith(c):
-                return True
-        if t.startswith("<pre><code"):
-            return True
-        return False
+    def _spawn(self, coro):
+        task = asyncio.create_task(coro)
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def _do_edit(self, peer, msg_id, text, entity):
+        try:
+            await self.client(EditMessageRequest(
+                peer=peer,
+                id=msg_id,
+                message=text,
+                entities=[entity],
+            ))
+        except Exception:
+            if DEBUG:
+                logger.info(f"SheoPre: edit fail {msg_id}")
+
+    def _preview_wrap(self, plain_text):
+        """Оборачивает plain-текст в HTML-теги согласно текущему режиму.
+        Внутренние спецсимволы экранируются, чтобы не сломать разметку."""
+        inner = plain_text.translate(_ESC_TABLE)
+        key = self.mode
+        if key == "pre":
+            return f"<pre>{inner}</pre>"
+        if key == "code":
+            return f"<code>{inner}</code>"
+        if key == "precode":
+            lang = (self.language or "").strip()
+            if lang:
+                return f'<pre><code class="language-{lang}">{inner}</code></pre>'
+            return f"<pre><code>{inner}</code></pre>"
+        if key == "blockquote":
+            return f"<blockquote>{inner}</blockquote>"
+        if key == "bold":
+            return f"<b>{inner}</b>"
+        if key == "italic":
+            return f"<i>{inner}</i>"
+        if key == "underline":
+            return f"<u>{inner}</u>"
+        if key == "strike":
+            return f"<s>{inner}</s>"
+        if key == "spoiler":
+            return f"<tg-spoiler>{inner}</tg-spoiler>"
+        return inner
 
     # ==================== Watcher ====================
 
     async def watcher(self, message):
-        if not self._wrap_open or self._shutdown or not self.enabled:
+        if self._shutdown or not self.enabled or self._entity_factory is None:
             return
         if not message.out:
             return
@@ -137,19 +189,12 @@ class SheoPreMod(loader.Module):
             return
 
         text = message.text
-        is_caption = False
         if text is None:
             text = message.caption
-            if text is None:
+            if text is None or not EDIT_CAPTIONS:
                 return
-            if not EDIT_CAPTIONS:
-                return
-            is_caption = True
 
         if SKIP_COMMANDS and text and text[0] in _COMMAND_CHARS:
-            return
-
-        if SKIP_IF_ALREADY_WRAPPED and self._already_wrapped(text):
             return
 
         if len(text) > MAX_LEN:
@@ -158,38 +203,31 @@ class SheoPreMod(loader.Module):
         if self._is_recent(message.id):
             return
 
-        if "<" in text or ">" in text or "&" in text:
-            inner = text.translate(_ESC_TABLE)
-        else:
-            inner = text
+        length = len(text.encode("utf-16-le")) // 2
+        entity = self._entity_factory(length, self.language)
 
-        new_text = self._wrap_open + inner + self._wrap_close
-
-        chat_id = message.chat_id
+        peer = getattr(message, "input_chat", None)
+        if peer is None:
+            peer = message.chat_id
         msg_id = message.id
 
-        try:
-            if is_caption:
-                await self.client.edit_message(
-                    chat_id, msg_id, text=new_text, parse_mode="html"
-                )
-            else:
-                await self.client.edit_message(
-                    chat_id, msg_id, new_text, parse_mode="html"
-                )
-        except Exception:
-            if DEBUG:
-                logger.info(f"SheoPre: edit fail {msg_id}")
+        coro = self._do_edit(peer, msg_id, text, entity)
+        if FIRE_AND_FORGET:
+            self._spawn(coro)
+        else:
+            await coro
 
     # ==================== Инлайн-форма ====================
 
     async def _build_modes_page(self):
-        text = (
-            "<b>SheoPre — выбор режима</b>\n\n"
-            f"Включено: <b>{'да' if self.enabled else 'нет'}</b>\n"
-            f"Текущий режим: <b>{self._mode_label_cache}</b>\n\n"
-            "Нажмите на режим, чтобы выбрать."
+        # Plain-текст, который будет обёрнут в текущий режим
+        plain = (
+            f"Включено: {'да' if self.enabled else 'нет'}\n"
+            f"Режим: {self._mode_label_cache}\n\n"
         )
+
+        # Оборачиваем всё полотно в текущий режим
+        text = self._preview_wrap(plain)
 
         buttons = [[{
             "text": "Выключить" if self.enabled else "Включить",
@@ -268,7 +306,9 @@ class SheoPreMod(loader.Module):
                 self._apply_mode(key)
                 self.database.set("SheoPre", "mode", key)
                 try:
-                    await message.edit(f"Режим: {self._mode_label_cache}")
+                    await message.edit(
+                        self._preview_wrap(f"Режим: {self._mode_label_cache}")
+                    )
                 except Exception:
                     pass
                 return
@@ -277,7 +317,7 @@ class SheoPreMod(loader.Module):
                 self.enabled = True
                 self.database.set("SheoPre", "enabled", True)
                 try:
-                    await message.edit("Обёртка включена")
+                    await message.edit(self._preview_wrap("Обёртка включена"))
                 except Exception:
                     pass
                 return
@@ -286,7 +326,7 @@ class SheoPreMod(loader.Module):
                 self.enabled = False
                 self.database.set("SheoPre", "enabled", False)
                 try:
-                    await message.edit("Обёртка выключена")
+                    await message.edit(self._preview_wrap("Обёртка выключена"))
                 except Exception:
                     pass
                 return
@@ -326,10 +366,12 @@ class SheoPreMod(loader.Module):
             current = self.language if self.language else "(не задан)"
             try:
                 await message.edit(
-                    f"<b>Язык подсветки:</b> <b>{current}</b>\n\n"
-                    f"Установить: <code>.яз python</code>\n"
-                    f"Очистить: <code>.яз clear</code>\n\n"
-                    f"<i>{COMMON_LANGS_HINT}</i>"
+                    self._preview_wrap(
+                        f"Язык подсветки: {current}\n\n"
+                        f"Установить: .яз python\n"
+                        f"Очистить: .яз clear\n\n"
+                        f"{COMMON_LANGS_HINT}"
+                    )
                 )
             except Exception:
                 pass
@@ -339,7 +381,7 @@ class SheoPreMod(loader.Module):
             self._apply_language("")
             self.database.set("SheoPre", "language", "")
             try:
-                await message.edit("Язык очищен")
+                await message.edit(self._preview_wrap("Язык очищен"))
             except Exception:
                 pass
             return
@@ -347,6 +389,6 @@ class SheoPreMod(loader.Module):
         self._apply_language(code)
         self.database.set("SheoPre", "language", self.language)
         try:
-            await message.edit(f"Язык: <code>{self.language}</code>")
+            await message.edit(self._preview_wrap(f"Язык: {self.language}"))
         except Exception:
             pass
