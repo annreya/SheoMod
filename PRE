@@ -1,0 +1,352 @@
+# meta developer: @sheomod
+# meta banner: https://t.me/xsheo
+
+from .. import loader, utils
+import time
+import logging
+from telethon.tl.types import Message
+
+logger = logging.getLogger("sheopre")
+
+
+# ==================== Конфиг ====================
+
+SKIP_IF_ALREADY_WRAPPED = True
+SKIP_COMMANDS = True
+EDIT_CAPTIONS = True
+MAX_LEN = 4000
+DEDUP_TTL = 10
+DEDUP_MAX = 200
+DEBUG = False
+
+# Режимы: key -> (название, open, close)
+MODES = {
+    "pre":        ("pre",          "<pre>",         "</pre>"),
+    "code":       ("code",         "<code>",        "</code>"),
+    "precode":    ("pre + code",   "<pre><code>",   "</code></pre>"),
+    "blockquote": ("цитата",       "<blockquote>",  "</blockquote>"),
+    "bold":       ("жирный",       "<b>",           "</b>"),
+    "italic":     ("курсив",       "<i>",           "</i>"),
+    "underline":  ("подчёркнутый", "<u>",           "</u>"),
+    "strike":     ("зачёркнутый",  "<s>",           "</s>"),
+    "spoiler":    ("спойлер",      "<tg-spoiler>",  "</tg-spoiler>"),
+}
+
+DEFAULT_MODE = "pre"
+DEFAULT_LANG = ""
+
+COMMON_LANGS_HINT = (
+    "python, javascript, typescript, java, kotlin, c, cpp, csharp, "
+    "go, rust, php, ruby, swift, sql, json, yaml, xml, html, css, "
+    "bash, shell, dockerfile, lua, r, dart, perl, scala, ..."
+)
+
+_WRAP_PAIRS = tuple(
+    (o, c) for _k, (_n, o, c) in MODES.items() if o and c
+)
+_ESC_TABLE = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
+_COMMAND_CHARS = frozenset("./!")
+_MODE_KEYS = frozenset(MODES.keys())
+
+
+class SheoPreMod(loader.Module):
+    """Оборачивает ваши сообщения в HTML-тег"""
+
+    strings = {"name": "SheoPre"}
+
+    __slots__ = (
+        "database", "client", "enabled", "mode", "language",
+        "_wrap_open", "_wrap_close", "_mode_label_cache",
+        "_processed", "_shutdown",
+    )
+
+    def __init__(self):
+        self.database = None
+        self.client = None
+        self.enabled = True
+        self.mode = DEFAULT_MODE
+        self.language = DEFAULT_LANG
+        self._wrap_open = MODES[DEFAULT_MODE][1]
+        self._wrap_close = MODES[DEFAULT_MODE][2]
+        self._mode_label_cache = MODES[DEFAULT_MODE][0]
+        self._processed = {}
+        self._shutdown = False
+        super().__init__()
+
+    async def client_ready(self, client, database):
+        self.client = client
+        self.database = database
+        self.enabled = self.database.get("SheoPre", "enabled", True)
+        mode = self.database.get("SheoPre", "mode", DEFAULT_MODE)
+        self.language = self.database.get("SheoPre", "language", DEFAULT_LANG) or ""
+        self._apply_mode(mode if mode in _MODE_KEYS else DEFAULT_MODE)
+        self._shutdown = False
+
+    async def on_unload(self):
+        self._shutdown = True
+
+    # ==================== Внутренние ====================
+
+    def _apply_mode(self, key):
+        self.mode = key
+        name, o, c = MODES[key]
+        if key == "precode":
+            lang = (self.language or "").strip()
+            if lang:
+                o = f'<pre><code class="language-{lang}">'
+            else:
+                o = '<pre><code>'
+        self._wrap_open = o
+        self._wrap_close = c
+        self._mode_label_cache = name
+
+    def _apply_language(self, code):
+        self.language = (code or "").strip()
+        if self.mode == "precode":
+            self._apply_mode("precode")
+
+    def _is_recent(self, msg_id):
+        d = self._processed
+        if msg_id in d:
+            return True
+        d[msg_id] = time.time()
+        if len(d) > DEDUP_MAX:
+            cutoff = time.time() - DEDUP_TTL
+            for k in [k for k, t in d.items() if t < cutoff]:
+                d.pop(k, None)
+        return False
+
+    @staticmethod
+    def _already_wrapped(text):
+        t = text.strip()
+        for o, c in _WRAP_PAIRS:
+            if t.startswith(o) and t.endswith(c):
+                return True
+        if t.startswith("<pre><code"):
+            return True
+        return False
+
+    # ==================== Watcher ====================
+
+    async def watcher(self, message):
+        if not self._wrap_open or self._shutdown or not self.enabled:
+            return
+        if not message.out:
+            return
+        if message.edit_date is not None:
+            return
+
+        text = message.text
+        is_caption = False
+        if text is None:
+            text = message.caption
+            if text is None:
+                return
+            if not EDIT_CAPTIONS:
+                return
+            is_caption = True
+
+        if SKIP_COMMANDS and text and text[0] in _COMMAND_CHARS:
+            return
+
+        if SKIP_IF_ALREADY_WRAPPED and self._already_wrapped(text):
+            return
+
+        if len(text) > MAX_LEN:
+            return
+
+        if self._is_recent(message.id):
+            return
+
+        if "<" in text or ">" in text or "&" in text:
+            inner = text.translate(_ESC_TABLE)
+        else:
+            inner = text
+
+        new_text = self._wrap_open + inner + self._wrap_close
+
+        chat_id = message.chat_id
+        msg_id = message.id
+
+        try:
+            if is_caption:
+                await self.client.edit_message(
+                    chat_id, msg_id, text=new_text, parse_mode="html"
+                )
+            else:
+                await self.client.edit_message(
+                    chat_id, msg_id, new_text, parse_mode="html"
+                )
+        except Exception:
+            if DEBUG:
+                logger.info(f"SheoPre: edit fail {msg_id}")
+
+    # ==================== Инлайн-форма ====================
+
+    async def _build_modes_page(self):
+        text = (
+            "<b>SheoPre — выбор режима</b>\n\n"
+            f"Включено: <b>{'да' if self.enabled else 'нет'}</b>\n"
+            f"Текущий режим: <b>{self._mode_label_cache}</b>\n\n"
+            "Нажмите на режим, чтобы выбрать."
+        )
+
+        buttons = [[{
+            "text": "Выключить" if self.enabled else "Включить",
+            "callback": self._toggle_callback,
+            "args": (),
+        }]]
+
+        row = []
+        for key, (name, _o, _c) in MODES.items():
+            label = f"[{name}]" if key == self.mode else name
+            row.append({
+                "text": label,
+                "callback": self._mode_callback,
+                "args": (key,),
+            })
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        buttons.append([{"text": "Закрыть", "action": "close"}])
+        return text, buttons
+
+    async def _toggle_callback(self, call):
+        self.enabled = not self.enabled
+        self.database.set("SheoPre", "enabled", self.enabled)
+        try:
+            await call.answer(
+                f"Обёртка {'включена' if self.enabled else 'выключена'}",
+                show_alert=False,
+            )
+        except Exception:
+            pass
+        text, buttons = await self._build_modes_page()
+        try:
+            await call.edit(text=text, reply_markup=buttons)
+        except Exception:
+            pass
+
+    async def _mode_callback(self, call, key):
+        if key not in _MODE_KEYS:
+            try:
+                await call.answer("Неизвестный режим", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        self._apply_mode(key)
+        self.database.set("SheoPre", "mode", key)
+
+        try:
+            await call.answer(f"Режим: {self._mode_label_cache}", show_alert=False)
+        except Exception:
+            pass
+
+        text, buttons = await self._build_modes_page()
+        try:
+            await call.edit(text=text, reply_markup=buttons)
+        except Exception:
+            pass
+
+    # ==================== Команды ====================
+
+    @loader.command(
+        ru_doc="Форма выбора режима",
+        en_doc="Mode selection form",
+    )
+    async def преcmd(self, message):
+        """Форма выбора режима"""
+        args = utils.get_args_raw(message)
+        if args:
+            key = args.strip().lower()
+
+            if key in _MODE_KEYS:
+                self._apply_mode(key)
+                self.database.set("SheoPre", "mode", key)
+                try:
+                    await message.edit(f"Режим: {self._mode_label_cache}")
+                except Exception:
+                    pass
+                return
+
+            if key in ("on", "вкл", "enable"):
+                self.enabled = True
+                self.database.set("SheoPre", "enabled", True)
+                try:
+                    await message.edit("Обёртка включена")
+                except Exception:
+                    pass
+                return
+
+            if key in ("off", "выкл", "disable"):
+                self.enabled = False
+                self.database.set("SheoPre", "enabled", False)
+                try:
+                    await message.edit("Обёртка выключена")
+                except Exception:
+                    pass
+                return
+
+            modes_list = ", ".join(f"<code>{k}</code>" for k in MODES.keys())
+            try:
+                await message.edit(
+                    f"Неизвестная команда: <code>{key}</code>\n\n"
+                    f"<b>Режимы:</b> {modes_list}\n"
+                    f"<b>Вкл/выкл:</b> <code>.пре on</code> / <code>.пре off</code>"
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            text, buttons = await self._build_modes_page()
+            await self.inline.form(
+                text=text,
+                message=message,
+                reply_markup=buttons,
+                silent=True,
+            )
+        except Exception as e:
+            logger.error(f"преcmd form: {e}")
+
+    @loader.command(
+        ru_doc="<код> — указать язык подсветки для pre + code",
+        en_doc="<code> — set syntax highlighting language for pre + code",
+    )
+    async def язcmd(self, message):
+        """Указать язык подсветки"""
+        args = utils.get_args_raw(message)
+        code = (args or "").strip()
+
+        if not code:
+            current = self.language if self.language else "(не задан)"
+            try:
+                await message.edit(
+                    f"<b>Язык подсветки:</b> <b>{current}</b>\n\n"
+                    f"Установить: <code>.яз python</code>\n"
+                    f"Очистить: <code>.яз clear</code>\n\n"
+                    f"<i>{COMMON_LANGS_HINT}</i>"
+                )
+            except Exception:
+                pass
+            return
+
+        if code.lower() in ("clear", "none", "off", "-"):
+            self._apply_language("")
+            self.database.set("SheoPre", "language", "")
+            try:
+                await message.edit("Язык очищен")
+            except Exception:
+                pass
+            return
+
+        self._apply_language(code)
+        self.database.set("SheoPre", "language", self.language)
+        try:
+            await message.edit(f"Язык: <code>{self.language}</code>")
+        except Exception:
+            pass
